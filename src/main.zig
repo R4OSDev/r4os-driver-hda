@@ -54,15 +54,27 @@ const COMMAND_GUARD: u32 = 10_000;
 const STREAM_GUARD: u32 = 10_000;
 const MAX_CODECS: usize = 4;
 const MAX_WIDGETS: usize = 48;
-const DMA_BUFFER_COUNT: usize = 16;
+const DMA_BUFFER_COUNT: usize = 64;
 const DMA_BUFFER_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
+const DMA_RING_BYTES: usize = DMA_BUFFER_COUNT * DMA_BUFFER_BYTES;
 const PCM_QUEUE_BYTES: usize = DMA_BUFFER_BYTES * 64;
 const PREFILL_PERIODS: usize = 16;
+const BUFFER_TARGET_PERIODS: usize = 32;
+const DMA_WINDOW_MS: u64 = DMA_BUFFER_COUNT * 10;
 const DRAIN_POSTROLL_PERIODS: usize = 3;
 const IRQ_ROUTE_CAPACITY: usize = 9;
 const WORK_HANDLE_CAPACITY: usize = 2;
 const HDA_BDL_IOC: u32 = 0x0000_0001;
-const HDA_FORMAT_48K_STEREO_S16: u16 = 0x0021;
+const HDA_FORMAT_BASE_48K: u16 = 0 << 14;
+const HDA_FORMAT_BITS_16: u16 = 1 << 4;
+const HDA_FORMAT_STEREO: u16 = 1;
+const HDA_FORMAT_48K_STEREO_S16: u16 =
+    HDA_FORMAT_BASE_48K | HDA_FORMAT_BITS_16 | HDA_FORMAT_STEREO;
+comptime {
+    if (HDA_FORMAT_48K_STEREO_S16 != 0x0011) {
+        @compileError("HDA 48-kHz stereo S16 stream format must be 0x0011");
+    }
+}
 const MIN_RATE: u32 = 8000;
 const MAX_RATE: u32 = 192_000;
 // Eight prefetched periods plus a partial tail can exceed 90 ms. Keep the
@@ -195,7 +207,7 @@ const State = struct {
     stream_desc_offset: u64 = 0,
     stream_desc_base: u64 = 0,
     stream_bdl: r4os.abi.DmaBuffer = .{},
-    stream_dma: [DMA_BUFFER_COUNT]r4os.abi.DmaBuffer = .{r4os.abi.DmaBuffer{}} ** DMA_BUFFER_COUNT,
+    stream_dma: r4os.abi.DmaBuffer = .{},
     stream_buffer_count: u8 = 0,
     stream_buffer_bytes: u32 = 0,
     stream_total_bytes: u32 = 0,
@@ -245,6 +257,8 @@ const State = struct {
     stream_sts_last: u8 = 0,
     stream_lpib_last: u32 = 0,
     stream_lpib_observed: u32 = 0,
+    position_observed_tick: u64 = 0,
+    position_tick_valid: bool = false,
     previous_stream_status: u8 = 0,
     irq_registered: bool = false,
     irq_mode: u8 = 0,
@@ -637,7 +651,7 @@ fn setupStreamDma(ctx: *const r4os.r4dev.DriverContext) bool {
     state.stream_desc_base = mmioBase() + state.stream_desc_offset;
     state.stream_buffer_count = @intCast(DMA_BUFFER_COUNT);
     state.stream_buffer_bytes = @intCast(DMA_BUFFER_BYTES);
-    state.stream_total_bytes = @intCast(DMA_BUFFER_COUNT * DMA_BUFFER_BYTES);
+    state.stream_total_bytes = @intCast(DMA_RING_BYTES);
     state.stream_format = HDA_FORMAT_48K_STEREO_S16;
 
     if (!resetStreamDescriptor(ctx)) {
@@ -649,6 +663,7 @@ fn setupStreamDma(ctx: *const r4os.r4dev.DriverContext) bool {
     programStreamDescriptorRegisters();
     state.periods = stream_ring.PeriodBook.init(DMA_BUFFER_COUNT);
     state.pcm_queue.clear();
+    state.position_tick_valid = false;
     state.previous_stream_status = 0;
     updateStreamStatus();
     state.dma_ready = true;
@@ -662,11 +677,9 @@ fn allocStreamDma(ctx: *const r4os.r4dev.DriverContext) bool {
         if (state.stream_bdl.phys_addr == 0 or state.stream_bdl.virt_addr == 0) return false;
     }
 
-    var i: usize = 0;
-    while (i < DMA_BUFFER_COUNT) : (i += 1) {
-        if (state.stream_dma[i].phys_addr != 0) continue;
-        if (ctx.allocDmaRegion(@intCast(DMA_BUFFER_BYTES), 128, &state.stream_dma[i]) != 0) return false;
-        if (state.stream_dma[i].phys_addr == 0 or state.stream_dma[i].virt_addr == 0) return false;
+    if (state.stream_dma.phys_addr == 0) {
+        if (ctx.allocDmaRegion(@intCast(DMA_RING_BYTES), 128, &state.stream_dma) != 0) return false;
+        if (state.stream_dma.phys_addr == 0 or state.stream_dma.virt_addr == 0 or state.stream_dma.bytes < DMA_RING_BYTES) return false;
     }
     return true;
 }
@@ -695,13 +708,9 @@ fn resetStreamDescriptor(ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn clearStreamBuffers() void {
-    var i: usize = 0;
-    while (i < DMA_BUFFER_COUNT) : (i += 1) {
-        if (state.stream_dma[i].virt_addr == 0) continue;
-        const ptr: [*]u8 = @ptrFromInt(state.stream_dma[i].virt_addr);
-        var j: usize = 0;
-        while (j < DMA_BUFFER_BYTES) : (j += 1) ptr[j] = 0;
-    }
+    if (state.stream_dma.virt_addr == 0) return;
+    const ptr: [*]u8 = @ptrFromInt(state.stream_dma.virt_addr);
+    @memset(ptr[0..DMA_RING_BYTES], 0);
 }
 
 fn programBdl() void {
@@ -710,7 +719,7 @@ fn programBdl() void {
     var i: usize = 0;
     while (i < DMA_BUFFER_COUNT) : (i += 1) {
         bdl[i] = .{
-            .addr = state.stream_dma[i].phys_addr,
+            .addr = state.stream_dma.phys_addr + i * DMA_BUFFER_BYTES,
             .length = @intCast(DMA_BUFFER_BYTES),
             .flags = HDA_BDL_IOC,
         };
@@ -955,6 +964,9 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
 
     refreshPlaybackPosition(&ctx);
     fillDmaPeriods(&ctx);
+    if (state.playback_started and bufferedPlaybackPeriods() >= BUFFER_TARGET_PERIODS) {
+        return finishWrite(r4os.abi.service_api_result_busy, write_start);
+    }
     const required_capacity = output_frames * pcm.TARGET_FRAME_BYTES;
     if (required_capacity > state.pcm_queue.free(&pcm_queue_storage)) {
         state.queue_overflow_count += 1;
@@ -1050,6 +1062,11 @@ fn fillDmaPeriods(ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
+fn bufferedPlaybackPeriods() usize {
+    const queued_bytes = state.periods.queued * DMA_BUFFER_BYTES + state.pcm_queue.used;
+    return (queued_bytes + DMA_BUFFER_BYTES - 1) / DMA_BUFFER_BYTES;
+}
+
 fn flushTailPeriod(ctx: *const r4os.r4dev.DriverContext) bool {
     if (state.pcm_queue.used == 0) return true;
     refreshPlaybackPosition(ctx);
@@ -1105,8 +1122,16 @@ fn serviceStreamStatus(ctx: *const r4os.r4dev.DriverContext) void {
 
 fn refreshPlaybackPosition(ctx: *const r4os.r4dev.DriverContext) void {
     if (!state.playback_started or state.stream_total_bytes == 0) return;
+    const now = ctx.tickCount();
     const old_current = state.periods.current;
     const current = currentDmaSlot();
+    if (state.position_tick_valid and now -| state.position_observed_tick >= msTicks(ctx, DMA_WINDOW_MS)) {
+        expirePlaybackWindow(ctx);
+        state.position_observed_tick = now;
+        return;
+    }
+    state.position_observed_tick = now;
+    state.position_tick_valid = true;
     const advance = state.periods.advance(current);
     if (advance.periods == 0) return;
 
@@ -1129,6 +1154,27 @@ fn refreshPlaybackPosition(ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
+fn expirePlaybackWindow(ctx: *const r4os.r4dev.DriverContext) void {
+    const first_underrun = state.underrun_count == 0;
+    const expired = state.periods.queued;
+    const lost = @max(expired, DMA_BUFFER_COUNT);
+    state.underrun_count +%= lost;
+    state.silence_refill_count +%= lost;
+    state.underrun_active = true;
+    state.last_error = "stream observation window elapsed";
+    if (first_underrun) ctx.logWarn("HDA.R4D first stream observation lapse");
+
+    // Once a complete DMA window elapsed without a position observation,
+    // LPIB may point at the same descriptor as before even though hardware
+    // wrapped the ring.  The active descriptor can therefore no longer be
+    // cleared safely in place.  Stop and reset the stream before clearing
+    // every period; otherwise that one stale 10 ms fragment repeats on each
+    // 160 ms ring traversal.
+    if (!recoverStream(ctx, "stream observation lapse")) {
+        state.error_count +%= 1;
+    }
+}
+
 fn currentDmaSlot() usize {
     if (state.stream_buffer_bytes == 0) return 0;
     const position = read32(state.stream_desc_base + SD_LPIB);
@@ -1144,6 +1190,9 @@ fn startPlaybackIfNeeded() void {
     const stream_bits: u32 = @as(u32, state.output_stream_id & 0x0F) << SD_CTL_STREAM_SHIFT;
     write32(state.stream_desc_base + SD_CTL, stream_bits | SD_CTL_IRQ_ENABLE | SD_CTL_RUN);
     state.playback_started = true;
+    const ctx = context();
+    state.position_observed_tick = ctx.tickCount();
+    state.position_tick_valid = true;
     state.start_count += 1;
     updateStreamStatus();
 }
@@ -1202,6 +1251,7 @@ fn stopPlayback(ctx: *const r4os.r4dev.DriverContext) void {
         programStreamDescriptorRegisters();
     }
     state.playback_started = false;
+    state.position_tick_valid = false;
     state.periods.reset();
     state.pcm_queue.clear();
     state.resampler_state.reset();
@@ -1214,6 +1264,7 @@ fn recoverStream(ctx: *const r4os.r4dev.DriverContext, reason: [*:0]const u8) bo
     state.stream_recovery_count += 1;
     state.last_recovery = reason;
     state.playback_started = false;
+    state.position_tick_valid = false;
     state.dropped_frame_count +%= state.pcm_queue.used / pcm.TARGET_FRAME_BYTES;
     if (!resetStreamDescriptor(ctx)) {
         state.dma_fail_count += 1;
@@ -1249,12 +1300,9 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
     }
     clearStreamBuffers();
 
-    var i: usize = 0;
-    while (i < DMA_BUFFER_COUNT) : (i += 1) {
-        if (state.stream_dma[i].phys_addr != 0) {
-            ctx.freeDmaRegion(&state.stream_dma[i]);
-            state.stream_dma[i] = .{};
-        }
+    if (state.stream_dma.phys_addr != 0) {
+        ctx.freeDmaRegion(&state.stream_dma);
+        state.stream_dma = .{};
     }
     if (state.stream_bdl.phys_addr != 0) {
         ctx.freeDmaRegion(&state.stream_bdl);
@@ -1289,12 +1337,13 @@ fn releaseStream() void {
 
 fn dmaSlice(index: usize) ?[]u8 {
     if (index >= DMA_BUFFER_COUNT) return null;
-    const buffer = state.stream_dma[index];
+    const buffer = state.stream_dma;
     if (buffer.virt_addr == 0 or buffer.bytes == 0) return null;
     const available: usize = @intCast(buffer.bytes);
-    const bytes = if (available < DMA_BUFFER_BYTES) available else DMA_BUFFER_BYTES;
-    const ptr: [*]u8 = @ptrFromInt(buffer.virt_addr);
-    return ptr[0..bytes];
+    const offset = index * DMA_BUFFER_BYTES;
+    if (offset > available or DMA_BUFFER_BYTES > available - offset) return null;
+    const ptr: [*]u8 = @ptrFromInt(buffer.virt_addr + offset);
+    return ptr[0..DMA_BUFFER_BYTES];
 }
 
 fn setLastResult(result: i32) i32 {

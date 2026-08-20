@@ -1,4 +1,4 @@
-HDA.R4D 0.2.0
+HDA.R4D 0.3.0
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -10,10 +10,12 @@ Format und Puffer
 -----------------
 Das Hardwareformat ist 48.000 Hz, Stereo, Signed 16 Bit Little Endian. Ein
 DMA-Zeitraum umfasst 480 Frames beziehungsweise 1.920 Byte und damit 10 ms.
-Sechzehn feste, 128-Byte-ausgerichtete Zeitraeume bilden den zyklischen Ring;
-die vorgeschaltete ByteQueue fasst 64 Zeitraeume.
+64 feste, 128-Byte-ausgerichtete Zeitraeume bilden in einer zusammenhaengenden
+DMA-Allokation den zyklischen Ring; die vorgeschaltete ByteQueue fasst
+ebenfalls 64 Zeitraeume.
 
-writePcm akzeptiert beliebige gueltige frame-ausgerichtete Paketgroessen und
+writePcm akzeptiert gueltige frame-ausgerichtete Paketgroessen bis zur
+32-Perioden-Sollreserve und meldet danach nichtblockierend Busy. Es
 konvertiert streamingfaehig in das Hardwareformat. Paketgrenzen sind keine
 BDLE-Grenzen. Vollstaendige Zeitraeume werden in freie, nicht vom Controller
 besessene Slots kopiert. Nur ein Rest beim Drain darf mit Null aufgefuellt
@@ -23,12 +25,13 @@ Postroll ist keine Underrun-Recovery; kurze Normalpakete erzeugen keine Stille.
 
 BDL und Besitz
 --------------
-Alle 16 BDLEs, CBL und LVI werden bei geloeschtem RUN aufgebaut. Jeder BDLE
+Alle 64 BDLEs, CBL und LVI werden bei geloeschtem RUN aufgebaut. Jeder BDLE
 setzt IOC. Die Tabelle bleibt waehrend RUN unveraendert. PeriodBook verwaltet
 Producer, aktuelle Hardwareperiode, Ready-Bits und Fuellstand. Ein Ready-Slot
 oder die aktive Periode darf nicht ueberschrieben werden. RUN startet nach
-allen sechzehn vorgefuellten Perioden (160 ms). Ein Drain darf auch einen
-kuerzeren, abgeschlossenen Klang mit einer Periode starten.
+sechzehn vorgefuellten Perioden (160 ms); danach darf die laufende Reserve
+bis 32 Perioden (320 ms) wachsen. Ein Drain darf auch einen kuerzeren,
+abgeschlossenen Klang mit einer Periode starten.
 
 Interrupts und Arbeit
 ---------------------
@@ -47,7 +50,10 @@ Unterlauf und Lebenszyklus
 Ein Unterlauf entsteht nur, wenn LPIB in eine nicht vorbereitete Periode
 wechselt. Dann werden underruns und silence_refills getrennt von Upstream-
 Drops und Backendfehlern erhoeht. DESE fordert Recovery an, FIFOE bleibt ein
-sichtbarer Streamfehler.
+sichtbarer Streamfehler. Nach einem Consumer-Sprung wird der Producer direkt
+hinter die aktuelle Hardwareperiode gesetzt. Bleibt jede Positionsbeobachtung
+fuer ein komplettes 640-ms-DMA-Fenster aus, wird der Descriptor kontrolliert
+gestoppt und zurueckgesetzt; alter Ringinhalt kann nicht wiederholt werden.
 
 Stop drainiert Nutzframes und drei Postroll-Perioden hoechstens 250 ms,
 loescht RUN und wartet mindestens mit dem zeitbasierten 10-ms-Vertrag aus

@@ -1,4 +1,4 @@
-pub const maximum_periods: usize = 32;
+pub const maximum_periods: usize = 256;
 
 pub const ByteQueue = struct {
     read_pos: usize = 0,
@@ -110,7 +110,19 @@ pub const PeriodBook = struct {
             if (!self.ready[cursor]) result.missing += 1;
         }
         self.current = current;
+        if (result.missing != 0) self.producer = (current + 1) % self.count;
         return result;
+    }
+
+    pub fn expireWindow(self: *PeriodBook, current: usize) usize {
+        if (!self.running or current >= self.count) return 0;
+        const expired = self.queued;
+        var index: usize = 0;
+        while (index < self.count) : (index += 1) self.ready[index] = false;
+        self.current = current;
+        self.producer = (current + 1) % self.count;
+        self.queued = 0;
+        return expired;
     }
 };
 
@@ -169,6 +181,15 @@ test "period book reports an unfilled period and recovers ahead" {
     try std.testing.expect(book.commit(2));
     const recovered = book.advance(2);
     try std.testing.expectEqual(@as(usize, 0), recovered.missing);
+
+    book.reset();
+    try std.testing.expect(book.commit(0));
+    try std.testing.expect(book.commit(1));
+    try std.testing.expect(book.start(0));
+    _ = book.advance(1);
+    const delayed = book.advance(3);
+    try std.testing.expectEqual(@as(usize, 2), delayed.missing);
+    try std.testing.expectEqual(@as(usize, 0), book.nextWritable().?);
 }
 
 test "period book reports a wraparound gap instead of replaying stale data" {
@@ -184,6 +205,16 @@ test "period book reports a wraparound gap instead of replaying stale data" {
     _ = book.advance(3);
     const wrapped = book.advance(0);
     try std.testing.expectEqual(@as(usize, 1), wrapped.missing);
+    try std.testing.expectEqual(@as(usize, 0), book.queued);
+    try std.testing.expectEqual(@as(usize, 1), book.nextWritable().?);
+
+    book.reset();
+    try std.testing.expect(book.commit(0));
+    try std.testing.expect(book.commit(1));
+    try std.testing.expect(book.commit(2));
+    try std.testing.expect(book.commit(3));
+    try std.testing.expect(book.start(0));
+    try std.testing.expectEqual(@as(usize, 4), book.expireWindow(0));
     try std.testing.expectEqual(@as(usize, 0), book.queued);
     try std.testing.expectEqual(@as(usize, 1), book.nextWritable().?);
 }
