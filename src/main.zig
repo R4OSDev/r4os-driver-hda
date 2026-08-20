@@ -1,5 +1,6 @@
 const r4os = @import("r4os");
 const pcm = r4os.audio_pcm;
+const stream_ring = @import("stream_ring.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("hda_init", "hda_shutdown"));
@@ -33,10 +34,15 @@ const SD_BDPL: u64 = 0x18;
 const SD_BDPU: u64 = 0x1C;
 
 const GCTL_CRST: u32 = 0x0000_0001;
+const INTCTL_GIE: u32 = 0x8000_0000;
 const ICIS_BUSY: u16 = 0x0001;
 const ICIS_VALID: u16 = 0x0002;
 const SD_CTL_SRST: u32 = 0x0000_0001;
 const SD_CTL_RUN: u32 = 0x0000_0002;
+const SD_CTL_IOCE: u32 = 0x0000_0004;
+const SD_CTL_FEIE: u32 = 0x0000_0008;
+const SD_CTL_DEIE: u32 = 0x0000_0010;
+const SD_CTL_IRQ_ENABLE: u32 = SD_CTL_IOCE | SD_CTL_FEIE | SD_CTL_DEIE;
 const SD_CTL_STREAM_SHIFT: u5 = 20;
 const SD_STS_BCIS: u8 = 0x04;
 const SD_STS_FIFOE: u8 = 0x08;
@@ -48,15 +54,21 @@ const COMMAND_GUARD: u32 = 10_000;
 const STREAM_GUARD: u32 = 10_000;
 const MAX_CODECS: usize = 4;
 const MAX_WIDGETS: usize = 48;
-const DMA_BUFFER_COUNT: usize = 8;
-const DMA_BUFFER_BYTES: usize = 4096;
+const DMA_BUFFER_COUNT: usize = 16;
+const DMA_BUFFER_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
+const PCM_QUEUE_BYTES: usize = DMA_BUFFER_BYTES * 64;
+const PREFILL_PERIODS: usize = 16;
+const DRAIN_POSTROLL_PERIODS: usize = 3;
+const IRQ_ROUTE_CAPACITY: usize = 9;
+const WORK_HANDLE_CAPACITY: usize = 2;
 const HDA_BDL_IOC: u32 = 0x0000_0001;
 const HDA_FORMAT_48K_STEREO_S16: u16 = 0x0021;
 const MIN_RATE: u32 = 8000;
 const MAX_RATE: u32 = 192_000;
-// 0.56.40: hz-neutral in ms (bei 100 Hz wie zuvor 5/200 Ticks).
-const PLAYBACK_WAIT_MS: u64 = 50;
-const DRAIN_WAIT_MS: u64 = 2000;
+// Eight prefetched periods plus a partial tail can exceed 90 ms. Keep the
+// close path bounded, but leave enough margin for one complete queued window.
+const DRAIN_WAIT_MS: u64 = 250;
+const RUN_CLEAR_TIMEOUT_MS: u64 = 10;
 
 const PARAM_VENDOR_ID: u8 = 0x00;
 const PARAM_REVISION_ID: u8 = 0x02;
@@ -188,8 +200,11 @@ const State = struct {
     stream_buffer_bytes: u32 = 0,
     stream_total_bytes: u32 = 0,
     stream_format: u16 = 0,
-    next_dma_index: usize = 0,
+    periods: stream_ring.PeriodBook = .{},
+    pcm_queue: stream_ring.ByteQueue = .{},
     playback_started: bool = false,
+    draining: bool = false,
+    underrun_active: bool = false,
     reset_stream_count: u64 = 0,
     dma_fail_count: u64 = 0,
     write_count: u64 = 0,
@@ -207,6 +222,11 @@ const State = struct {
     drain_timeout_count: u64 = 0,
     refill_timeout_count: u64 = 0,
     stream_recovery_count: u64 = 0,
+    queue_overflow_count: u64 = 0,
+    dropped_frame_count: u64 = 0,
+    tail_padding_frames: u64 = 0,
+    drain_postroll_period_count: u64 = 0,
+    underrun_count: u64 = 0,
     poll_count: u64 = 0,
     bcis_count: u64 = 0,
     fifo_error_count: u64 = 0,
@@ -224,7 +244,24 @@ const State = struct {
     stream_ctl_last: u32 = 0,
     stream_sts_last: u8 = 0,
     stream_lpib_last: u32 = 0,
+    stream_lpib_observed: u32 = 0,
     previous_stream_status: u8 = 0,
+    irq_registered: bool = false,
+    irq_mode: u8 = 0,
+    irq_routes: [IRQ_ROUTE_CAPACITY]u8 = .{0xFF} ** IRQ_ROUTE_CAPACITY,
+    irq_route_count: usize = 0,
+    irq_active_route: u8 = 0xFF,
+    irq_count: u64 = 0,
+    irq_handled: u64 = 0,
+    irq_unhandled: u64 = 0,
+    irq_work_submitted: u64 = 0,
+    irq_work_dropped: u64 = 0,
+    irq_generation: u64 = 0,
+    work_pending: bool = false,
+    work_handles: [WORK_HANDLE_CAPACITY]u32 = .{0} ** WORK_HANDLE_CAPACITY,
+    stream_lock: bool = false,
+    recovery_pending: bool = false,
+    shutting_down: bool = false,
     last_error: [*:0]const u8 = "none",
     last_recovery: [*:0]const u8 = "none",
     resampler_state: pcm.ResamplerState = .{},
@@ -232,6 +269,7 @@ const State = struct {
 };
 
 var state: State = .{};
+var pcm_queue_storage: [PCM_QUEUE_BYTES]u8 = undefined;
 
 // 0.56.40: hz-neutrale Laufzeit-Umrechnung (R4D kennt DEFAULT_HZ nicht
 // comptime; timerFrequency liefert die echte Tickrate).
@@ -317,12 +355,19 @@ export fn hda_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
         return -8;
     }
 
-    state.present = true;
+    if (!setupInterrupts(&ctx)) {
+        ctx.logError("HDA.R4D interrupt setup failed");
+        failStage(.dma);
+        shutdownHardware(&ctx);
+        return -9;
+    }
+
+    @atomicStore(bool, &state.present, true, .release);
     if (!registerPlaybackBackend(&ctx)) {
         ctx.logError("HDA.R4D audio backend register failed");
         failStage(.dma);
         shutdownHardware(&ctx);
-        return -9;
+        return -10;
     }
 
     state.stage = .ready;
@@ -602,7 +647,8 @@ fn setupStreamDma(ctx: *const r4os.r4dev.DriverContext) bool {
     clearStreamBuffers();
     programBdl();
     programStreamDescriptorRegisters();
-    state.next_dma_index = 0;
+    state.periods = stream_ring.PeriodBook.init(DMA_BUFFER_COUNT);
+    state.pcm_queue.clear();
     state.previous_stream_status = 0;
     updateStreamStatus();
     state.dma_ready = true;
@@ -629,7 +675,7 @@ fn resetStreamDescriptor(ctx: *const r4os.r4dev.DriverContext) bool {
     state.reset_stream_count += 1;
     const control = read32(state.stream_desc_base + SD_CTL);
     write32(state.stream_desc_base + SD_CTL, control & ~SD_CTL_RUN);
-    if (!wait32Clear(state.stream_desc_base + SD_CTL, SD_CTL_RUN, STREAM_GUARD)) {
+    if (!waitRunClear(ctx)) {
         noteHdaWarn(ctx, "output stream did not stop");
         return false;
     }
@@ -680,6 +726,184 @@ fn programStreamDescriptorRegisters() void {
     write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
 }
 
+fn setupInterrupts(ctx: *const r4os.r4dev.DriverContext) bool {
+    state.irq_registered = false;
+    state.irq_mode = 0;
+    state.irq_route_count = 0;
+    state.irq_active_route = 0xFF;
+    state.irq_routes = .{0xFF} ** IRQ_ROUTE_CAPACITY;
+    disableInterrupts();
+    if (optionDisabled(ctx, "irq")) return false;
+
+    if (!optionDisabled(ctx, "msi") and ctx.supportsDriverApi(16, @sizeOf(r4os.abi.DriverApi))) {
+        const msi_irq = ctx.pciEnableMsi(state.info);
+        if (msi_irq >= 0 and msi_irq < 32) {
+            const route: u8 = @intCast(msi_irq);
+            if (ctx.irqRegister(route, irqHandler, @intFromPtr(&state), r4os.abi.irq_flag_msi) == 0) {
+                state.irq_routes[0] = route;
+                state.irq_route_count = 1;
+                state.irq_registered = true;
+                state.irq_mode = 2;
+            }
+        }
+    }
+
+    if (!state.irq_registered) {
+        if (state.info.interrupt_line < 32) _ = registerIrqRoute(ctx, state.info.interrupt_line);
+        var gsi: u8 = 16;
+        while (gsi < 24) : (gsi += 1) _ = registerIrqRoute(ctx, gsi);
+        if (state.irq_route_count > 0) {
+            state.irq_registered = true;
+            state.irq_mode = 1;
+        }
+    }
+    if (!state.irq_registered) return false;
+
+    write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
+    const stream_mask = @as(u32, 1) << @intCast(state.stream_desc_index);
+    write32(mmioBase() + REG_INTCTL, INTCTL_GIE | stream_mask);
+    logInterruptSetup(ctx);
+    return true;
+}
+
+fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
+    if (route >= 32 or state.irq_route_count >= state.irq_routes.len) return false;
+    var index: usize = 0;
+    while (index < state.irq_route_count) : (index += 1) {
+        if (state.irq_routes[index] == route) return true;
+    }
+    if (ctx.irqRegister(route, irqHandler, @intFromPtr(&state), r4os.abi.irq_flag_shared | r4os.abi.irq_flag_level_low) != 0) return false;
+    state.irq_routes[state.irq_route_count] = route;
+    state.irq_route_count += 1;
+    return true;
+}
+
+fn disableInterrupts() void {
+    if (state.mmio.virt_addr == 0) return;
+    write32(mmioBase() + REG_INTCTL, 0);
+    if (state.stream_desc_base != 0) {
+        write32(state.stream_desc_base + SD_CTL, read32(state.stream_desc_base + SD_CTL) & ~SD_CTL_IRQ_ENABLE);
+        write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
+    }
+}
+
+fn unregisterInterrupts(ctx: *const r4os.r4dev.DriverContext) void {
+    var index: usize = 0;
+    while (index < state.irq_route_count) : (index += 1) {
+        const route = state.irq_routes[index];
+        if (route < 32) _ = ctx.irqUnregister(route, irqHandler, @intFromPtr(&state));
+    }
+    state.irq_registered = false;
+    state.irq_route_count = 0;
+}
+
+fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
+    const s: *State = @ptrFromInt(raw_context);
+    if (!@atomicLoad(bool, &s.present, .acquire) or s.stream_desc_base == 0) return 0;
+    const stream_mask = @as(u32, 1) << @intCast(s.stream_desc_index);
+    const int_status = read32(s.mmio.virt_addr + REG_INTSTS);
+    const stream_status = read8(s.stream_desc_base + SD_STS);
+    if ((int_status & stream_mask) == 0 and (stream_status & SD_STS_CLEAR) == 0) {
+        _ = @atomicRmw(u64, &s.irq_unhandled, .Add, 1, .acq_rel);
+        return 0;
+    }
+
+    _ = @atomicRmw(u64, &s.irq_count, .Add, 1, .acq_rel);
+    @atomicStore(u8, &s.irq_active_route, irq, .release);
+    if ((stream_status & SD_STS_BCIS) != 0) _ = @atomicRmw(u64, &s.bcis_count, .Add, 1, .acq_rel);
+    if ((stream_status & SD_STS_FIFOE) != 0) _ = @atomicRmw(u64, &s.fifo_error_count, .Add, 1, .acq_rel);
+    if ((stream_status & SD_STS_DESE) != 0) {
+        _ = @atomicRmw(u64, &s.descriptor_error_count, .Add, 1, .acq_rel);
+        @atomicStore(bool, &s.recovery_pending, true, .release);
+    }
+    if ((stream_status & SD_STS_CLEAR) != 0) write8(s.stream_desc_base + SD_STS, stream_status & SD_STS_CLEAR);
+    _ = @atomicRmw(u64, &s.irq_generation, .Add, 1, .acq_rel);
+    scheduleRefillWork(s);
+    _ = @atomicRmw(u64, &s.irq_handled, .Add, 1, .acq_rel);
+    return r4os.abi.irq_result_handled;
+}
+
+fn scheduleRefillWork(s: *State) void {
+    if (@atomicRmw(bool, &s.work_pending, .Xchg, true, .acq_rel)) return;
+    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    releaseCompletedWork(&ctx);
+    var free_index: ?usize = null;
+    for (&s.work_handles, 0..) |*handle, index| {
+        if (@atomicLoad(u32, handle, .acquire) == 0) {
+            free_index = index;
+            break;
+        }
+    }
+    const index = free_index orelse {
+        _ = @atomicRmw(u64, &s.irq_work_dropped, .Add, 1, .acq_rel);
+        @atomicStore(bool, &s.work_pending, false, .release);
+        return;
+    };
+
+    var handle: u32 = 0;
+    if (ctx.workSubmit(refillWork, @intFromPtr(s), r4os.abi.driver_work_flag_from_irq, &handle) != 0 or handle == 0) {
+        _ = @atomicRmw(u64, &s.irq_work_dropped, .Add, 1, .acq_rel);
+        @atomicStore(bool, &s.work_pending, false, .release);
+        return;
+    }
+    @atomicStore(u32, &s.work_handles[index], handle, .release);
+    _ = @atomicRmw(u64, &s.irq_work_submitted, .Add, 1, .acq_rel);
+}
+
+fn refillWork(raw_context: usize) callconv(.c) i32 {
+    const s: *State = @ptrFromInt(raw_context);
+    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    releaseCompletedWork(&ctx);
+    if (!@atomicLoad(bool, &s.shutting_down, .acquire)) {
+        if (tryAcquireStream()) {
+            defer releaseStream();
+            if (@atomicRmw(bool, &s.recovery_pending, .Xchg, false, .acq_rel)) {
+                _ = recoverStream(&ctx, "descriptor error");
+            } else {
+                refreshPlaybackPosition(&ctx);
+                fillDmaPeriods(&ctx);
+                startPlaybackIfNeeded();
+            }
+        }
+    }
+    @atomicStore(bool, &s.work_pending, false, .release);
+    return 0;
+}
+
+fn releaseCompletedWork(ctx: *const r4os.r4dev.DriverContext) void {
+    for (&state.work_handles) |*stored| {
+        const handle = @atomicLoad(u32, stored, .acquire);
+        if (handle == 0) continue;
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        if (ctx.completionStatus(handle, &status) != 0) continue;
+        if (status.state != r4os.abi.driver_work_state_completed and status.state != r4os.abi.driver_work_state_cancelled) continue;
+        if (ctx.completionRelease(handle) == 0) @atomicStore(u32, stored, 0, .release);
+    }
+}
+
+fn releaseDriverWork(ctx: *const r4os.r4dev.DriverContext) void {
+    @atomicStore(bool, &state.work_pending, false, .release);
+    for (&state.work_handles) |*stored| {
+        const handle = @atomicLoad(u32, stored, .acquire);
+        if (handle == 0) continue;
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        if (ctx.completionStatus(handle, &status) == 0 and status.state == r4os.abi.driver_work_state_queued) _ = ctx.workCancel(handle);
+        var result: i32 = 0;
+        _ = ctx.completionWait(handle, msTicks(ctx, 100), &result);
+        if (ctx.completionRelease(handle) == 0) @atomicStore(u32, stored, 0, .release);
+    }
+}
+
+fn waitRunClear(ctx: *const r4os.r4dev.DriverContext) bool {
+    if ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) == 0) return true;
+    const deadline = ctx.tickCount() + msTicks(ctx, RUN_CLEAR_TIMEOUT_MS);
+    while ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) != 0) {
+        if (ctx.tickCount() >= deadline) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
+}
+
 fn registerPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
     state.backend = .{
         .formats = r4os.abi.audio_backend_format_s16le | r4os.abi.audio_backend_format_u8,
@@ -712,9 +936,13 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     _ = context_arg;
     var ctx = context();
     const write_start = ctx.tickCount();
-    if (!state.present or !state.dma_ready) return finishWrite(-1, write_start);
+    if (!@atomicLoad(bool, &state.present, .acquire) or !state.dma_ready) return finishWrite(-1, write_start);
+    releaseCompletedWork(&ctx);
+    if (!acquireStream(&ctx, 100)) return finishWrite(-6, write_start);
+    defer releaseStream();
     const input = data[0..@as(usize, @intCast(len))];
-    if (pcm.outputFrameCount(input.len, rate, channels, format) == 0) {
+    const output_frames = pcm.outputFrameCount(input.len, rate, channels, format);
+    if (output_frames == 0) {
         state.empty_write_count += 1;
         return finishWrite(-2, write_start);
     }
@@ -724,48 +952,45 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     state.last_source_format = format;
     state.last_output_bytes = 0;
     state.last_output_buffers = 0;
+
+    refreshPlaybackPosition(&ctx);
+    fillDmaPeriods(&ctx);
+    const required_capacity = output_frames * pcm.TARGET_FRAME_BYTES;
+    if (required_capacity > state.pcm_queue.free(&pcm_queue_storage)) {
+        state.queue_overflow_count += 1;
+        state.dropped_frame_count +%= output_frames;
+        return finishWrite(-3, write_start);
+    }
+
     state.resampler_state.beginChunk(rate, channels, format);
-
-    if (!preparePlaybackWrite(&ctx)) return setLastResult(-3);
-
-    var produced_any = false;
-    var guard: usize = 0;
-    while (guard < DMA_BUFFER_COUNT) : (guard += 1) {
-        const buffer_index = state.next_dma_index;
-        if (!waitDmaSlotReusable(&ctx, buffer_index)) {
-            _ = recoverStream(&ctx, "refill timeout");
+    var scratch: [DMA_BUFFER_BYTES]u8 = undefined;
+    while (!state.resampler_state.chunk_done) {
+        const converted = pcm.convertStreamingToStereoS16(&state.resampler_state, input, rate, channels, format, &scratch);
+        if (converted == 0) break;
+        if (!state.pcm_queue.writeAll(&pcm_queue_storage, scratch[0..converted])) {
+            state.queue_overflow_count += 1;
+            state.dropped_frame_count +%= (required_capacity - state.last_output_bytes) / pcm.TARGET_FRAME_BYTES;
             return finishWrite(-4, write_start);
         }
-        const refill_start = ctx.tickCount();
-        const out = dmaSlice(buffer_index) orelse return finishWrite(-5, write_start);
-        const converted = pcm.convertStreamingToStereoS16(&state.resampler_state, input, rate, channels, format, out);
-        if (converted < pcm.TARGET_FRAME_BYTES) break;
-        zeroTail(buffer_index, converted);
-        queueBdlEntry(buffer_index, DMA_BUFFER_BYTES);
         state.last_output_bytes += converted;
-        state.last_output_buffers += 1;
-        state.converted_frame_count += converted / pcm.TARGET_FRAME_BYTES;
-        state.refill_count += 1;
-        recordTickStat(&state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
-        produced_any = true;
-        state.next_dma_index = (state.next_dma_index + 1) % DMA_BUFFER_COUNT;
     }
-
-    if (!produced_any or state.last_output_bytes == 0 or state.last_output_buffers == 0) {
+    if (state.last_output_bytes == 0) {
         state.empty_write_count += 1;
-        return finishWrite(-6, write_start);
+        return finishWrite(-5, write_start);
     }
 
-    fillSilenceSlot(state.next_dma_index);
+    state.converted_frame_count +%= state.last_output_bytes / pcm.TARGET_FRAME_BYTES;
     state.write_count += 1;
+    fillDmaPeriods(&ctx);
     startPlaybackIfNeeded();
-    serviceStreamStatus(&ctx);
     return finishWrite(0, write_start);
 }
 
 fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
+    if (!acquireStream(&ctx, 100)) return setLastResult(-1);
+    defer releaseStream();
     stopPlayback(&ctx);
     return setLastResult(0);
 }
@@ -779,17 +1004,28 @@ fn shutdownBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
 
 fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) callconv(.c) i32 {
     _ = context_arg;
+    // Status is also the producer's pacing observation. IRQ work can be
+    // delayed or coalesced under TCG, so refresh ownership directly from
+    // LPIB before publishing the ring fill. Never wait behind an active
+    // writer; the next status or IRQ job will observe the position instead.
+    if (@atomicLoad(bool, &state.present, .acquire) and state.dma_ready and tryAcquireStream()) {
+        var ctx = context();
+        refreshPlaybackPosition(&ctx);
+        fillDmaPeriods(&ctx);
+        startPlaybackIfNeeded();
+        releaseStream();
+    }
     out.* = .{
-        .active = if (state.present and state.backend_registered and state.dma_ready) 1 else 0,
+        .active = if (@atomicLoad(bool, &state.present, .acquire) and state.backend_registered and state.dma_ready) 1 else 0,
         .writes = state.write_count,
-        .underruns = state.refill_timeout_count + state.drain_timeout_count,
-        .errors = state.error_count + state.timeout_count + state.fifo_error_count + state.descriptor_error_count,
+        .underruns = state.underrun_count,
+        .errors = state.error_count + state.timeout_count + state.fifo_error_count + state.descriptor_error_count + state.queue_overflow_count + state.drain_timeout_count + state.refill_timeout_count + state.irq_work_dropped,
         .last_result = state.last_result,
         .reserved = 0,
         .refills = state.refill_count,
         .silence_refills = state.silence_refill_count,
         .buffer_bytes = @intCast(state.stream_total_bytes),
-        .queued_buffers = @intCast(state.last_output_buffers),
+        .queued_buffers = @intCast(state.periods.queued),
         .last_buffer_bytes = @intCast(state.last_output_bytes),
         .last_write_ticks = state.write_last_ticks,
         .max_write_ticks = state.write_max_ticks,
@@ -801,43 +1037,43 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
     return 0;
 }
 
-fn preparePlaybackWrite(ctx: *const r4os.r4dev.DriverContext) bool {
-    serviceStreamStatus(ctx);
-    if (state.playback_started) return true;
-    if (!resetStreamDescriptor(ctx)) {
-        noteHdaWarn(ctx, "prepare reset failed");
-        return false;
+fn fillDmaPeriods(ctx: *const r4os.r4dev.DriverContext) void {
+    while (state.pcm_queue.used >= DMA_BUFFER_BYTES) {
+        const slot = state.periods.nextWritable() orelse break;
+        const refill_start = ctx.tickCount();
+        const out = dmaSlice(slot) orelse break;
+        if (!state.pcm_queue.readExact(&pcm_queue_storage, out)) break;
+        if (!state.periods.commit(slot)) break;
+        state.last_output_buffers += 1;
+        state.refill_count +%= 1;
+        recordTickStat(&state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
     }
-    clearStreamBuffers();
-    programBdl();
-    programStreamDescriptorRegisters();
-    state.next_dma_index = 0;
+}
+
+fn flushTailPeriod(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (state.pcm_queue.used == 0) return true;
+    refreshPlaybackPosition(ctx);
+    const slot = state.periods.nextWritable() orelse return false;
+    const out = dmaSlice(slot) orelse return false;
+    @memset(out, 0);
+    const copied = state.pcm_queue.readAvailable(&pcm_queue_storage, out);
+    if (copied == 0 or !state.periods.commit(slot)) return false;
+    state.tail_padding_frames +%= (DMA_BUFFER_BYTES - copied) / pcm.TARGET_FRAME_BYTES;
+    state.last_output_buffers += 1;
+    state.refill_count +%= 1;
     return true;
 }
 
-fn zeroTail(buffer_index: usize, used: usize) void {
-    if (used >= DMA_BUFFER_BYTES) return;
-    const out = dmaSlice(buffer_index) orelse return;
-    var i = used;
-    while (i < out.len) : (i += 1) out[i] = 0;
-}
-
-fn fillSilenceSlot(index: usize) void {
-    const out = dmaSlice(index) orelse return;
-    var i: usize = 0;
-    while (i < out.len) : (i += 1) out[i] = 0;
-    queueBdlEntry(index, DMA_BUFFER_BYTES);
-    state.silence_refill_count += 1;
-}
-
-fn queueBdlEntry(index: usize, len: usize) void {
-    if (state.stream_bdl.virt_addr == 0 or index >= DMA_BUFFER_COUNT) return;
-    const bdl: [*]volatile BdlEntry = @ptrFromInt(state.stream_bdl.virt_addr);
-    bdl[index] = .{
-        .addr = state.stream_dma[index].phys_addr,
-        .length = @intCast(len),
-        .flags = HDA_BDL_IOC,
-    };
+fn queueDrainPostroll(remaining: *usize) void {
+    while (remaining.* != 0) {
+        const slot = state.periods.nextWritable() orelse return;
+        const out = dmaSlice(slot) orelse return;
+        @memset(out, 0);
+        if (!state.periods.commit(slot)) return;
+        remaining.* -= 1;
+        state.drain_postroll_period_count +%= 1;
+        state.refill_count +%= 1;
+    }
 }
 
 fn updateStreamStatus() void {
@@ -851,67 +1087,94 @@ fn serviceStreamStatus(ctx: *const r4os.r4dev.DriverContext) void {
     if (!state.dma_ready or state.stream_desc_base == 0) return;
     state.poll_count += 1;
     const status = read8(state.stream_desc_base + SD_STS);
-    const raised = status & ~state.previous_stream_status;
-    if ((raised & SD_STS_BCIS) != 0) state.bcis_count += 1;
-    if ((raised & SD_STS_FIFOE) != 0) {
+    if ((status & SD_STS_BCIS) != 0) state.bcis_count +%= 1;
+    if ((status & SD_STS_FIFOE) != 0) {
         state.fifo_error_count += 1;
-        noteHdaWarn(ctx, "stream fifo error");
+        state.last_error = "stream fifo error";
     }
-    if ((raised & SD_STS_DESE) != 0) {
+    if ((status & SD_STS_DESE) != 0) {
         state.descriptor_error_count += 1;
-        noteHdaWarn(ctx, "stream descriptor error");
+        state.last_error = "stream descriptor error";
+        @atomicStore(bool, &state.recovery_pending, true, .release);
     }
     if ((status & SD_STS_CLEAR) != 0) write8(state.stream_desc_base + SD_STS, status & SD_STS_CLEAR);
     state.previous_stream_status = read8(state.stream_desc_base + SD_STS);
+    refreshPlaybackPosition(ctx);
     updateStreamStatus();
 }
 
-fn waitDmaSlotReusable(ctx: *const r4os.r4dev.DriverContext, index: usize) bool {
-    if (!state.playback_started) return true;
-    const deadline = ctx.tickCount() + msTicks(ctx, PLAYBACK_WAIT_MS);
-    while (ctx.tickCount() <= deadline) {
-        serviceStreamStatus(ctx);
-        if ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) == 0) return true;
-        if (currentDmaSlot() != index) return true;
+fn refreshPlaybackPosition(ctx: *const r4os.r4dev.DriverContext) void {
+    if (!state.playback_started or state.stream_total_bytes == 0) return;
+    const old_current = state.periods.current;
+    const current = currentDmaSlot();
+    const advance = state.periods.advance(current);
+    if (advance.periods == 0) return;
+
+    var slot = old_current;
+    var cleared: usize = 0;
+    while (cleared < advance.periods) : (cleared += 1) {
+        if (dmaSlice(slot)) |out| @memset(out, 0);
+        slot = (slot + 1) % DMA_BUFFER_COUNT;
     }
-    state.refill_timeout_count += 1;
-    noteHdaWarn(ctx, "refill timeout");
-    return false;
+
+    if (advance.missing > 0 and !state.draining) {
+        const first_underrun = state.underrun_count == 0;
+        state.underrun_count +%= advance.missing;
+        state.silence_refill_count +%= advance.missing;
+        state.underrun_active = true;
+        state.last_error = "stream underrun";
+        if (first_underrun) ctx.logWarn("HDA.R4D first stream underrun");
+    } else if (advance.missing == 0) {
+        state.underrun_active = false;
+    }
 }
 
 fn currentDmaSlot() usize {
     if (state.stream_buffer_bytes == 0) return 0;
-    const byte_pos: usize = @intCast(read32(state.stream_desc_base + SD_LPIB));
+    const position = read32(state.stream_desc_base + SD_LPIB);
+    state.stream_lpib_observed = position;
+    const byte_pos: usize = @intCast(position);
     return (byte_pos / @as(usize, @intCast(state.stream_buffer_bytes))) % DMA_BUFFER_COUNT;
 }
 
 fn startPlaybackIfNeeded() void {
     if (state.playback_started) return;
-    programStreamDescriptorRegisters();
+    const minimum = if (state.draining) @as(usize, 1) else PREFILL_PERIODS;
+    if (state.periods.queued < minimum or !state.periods.start(0)) return;
     const stream_bits: u32 = @as(u32, state.output_stream_id & 0x0F) << SD_CTL_STREAM_SHIFT;
-    write32(state.stream_desc_base + SD_CTL, stream_bits | SD_CTL_RUN);
+    write32(state.stream_desc_base + SD_CTL, stream_bits | SD_CTL_IRQ_ENABLE | SD_CTL_RUN);
     state.playback_started = true;
     state.start_count += 1;
     updateStreamStatus();
 }
 
 fn drainPlayback(ctx: *const r4os.r4dev.DriverContext) void {
-    if (!state.playback_started) return;
+    if (!state.playback_started and state.periods.queued == 0 and state.pcm_queue.used == 0) return;
     state.drain_count += 1;
+    state.draining = true;
     const start_tick = ctx.tickCount();
     const deadline = start_tick + msTicks(ctx, DRAIN_WAIT_MS);
+    var tail_flushed = state.pcm_queue.used == 0;
+    var postroll_remaining = DRAIN_POSTROLL_PERIODS;
     var drained = false;
     while (ctx.tickCount() <= deadline) {
-        serviceStreamStatus(ctx);
+        releaseCompletedWork(ctx);
+        refreshPlaybackPosition(ctx);
+        fillDmaPeriods(ctx);
+        if (!tail_flushed) tail_flushed = flushTailPeriod(ctx);
+        if (tail_flushed) queueDrainPostroll(&postroll_remaining);
+        startPlaybackIfNeeded();
         if ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) == 0) {
+            drained = postroll_remaining == 0 and state.periods.queued == 0 and state.pcm_queue.used == 0;
+            break;
+        }
+        if (tail_flushed and postroll_remaining == 0 and state.periods.queued == 0 and state.pcm_queue.used == 0) {
             drained = true;
             break;
         }
-        if (currentDmaSlot() == state.next_dma_index) {
-            drained = true;
-            break;
-        }
+        ctx.waitTicks(1);
     }
+    state.draining = false;
     state.last_drain_wait_ticks = ctx.tickCount() - start_tick;
     if (!drained) {
         state.drain_timeout_count += 1;
@@ -924,14 +1187,23 @@ fn stopPlayback(ctx: *const r4os.r4dev.DriverContext) void {
     drainPlayback(ctx);
     const control = read32(state.stream_desc_base + SD_CTL);
     write32(state.stream_desc_base + SD_CTL, control & ~SD_CTL_RUN);
-    if (!wait32Clear(state.stream_desc_base + SD_CTL, SD_CTL_RUN, STREAM_GUARD)) {
+    if (!waitRunClear(ctx)) {
         state.error_count += 1;
         _ = recoverStream(ctx, "stop timeout");
         return;
     }
     write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
+    if (!resetStreamDescriptor(ctx)) {
+        state.error_count += 1;
+        noteHdaWarn(ctx, "stop descriptor reset failed");
+    } else {
+        clearStreamBuffers();
+        programBdl();
+        programStreamDescriptorRegisters();
+    }
     state.playback_started = false;
-    state.next_dma_index = 0;
+    state.periods.reset();
+    state.pcm_queue.clear();
     state.resampler_state.reset();
     state.stop_count += 1;
     updateStreamStatus();
@@ -942,6 +1214,7 @@ fn recoverStream(ctx: *const r4os.r4dev.DriverContext, reason: [*:0]const u8) bo
     state.stream_recovery_count += 1;
     state.last_recovery = reason;
     state.playback_started = false;
+    state.dropped_frame_count +%= state.pcm_queue.used / pcm.TARGET_FRAME_BYTES;
     if (!resetStreamDescriptor(ctx)) {
         state.dma_fail_count += 1;
         noteHdaWarn(ctx, "stream recovery reset failed");
@@ -950,7 +1223,8 @@ fn recoverStream(ctx: *const r4os.r4dev.DriverContext, reason: [*:0]const u8) bo
     clearStreamBuffers();
     programBdl();
     programStreamDescriptorRegisters();
-    state.next_dma_index = 0;
+    state.periods.reset();
+    state.pcm_queue.clear();
     state.previous_stream_status = 0;
     state.resampler_state.reset();
     updateStreamStatus();
@@ -958,7 +1232,17 @@ fn recoverStream(ctx: *const r4os.r4dev.DriverContext, reason: [*:0]const u8) bo
 }
 
 fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
+    @atomicStore(bool, &state.shutting_down, true, .release);
+    if (!acquireStream(ctx, 100)) {
+        noteHdaWarn(ctx, "shutdown stream lock timeout");
+        return;
+    }
+    defer releaseStream();
     stopPlayback(ctx);
+    disableInterrupts();
+    unregisterInterrupts(ctx);
+    releaseDriverWork(ctx);
+    logPlaybackSummary(ctx);
     if (state.stream_desc_base != 0) {
         write32(state.stream_desc_base + SD_CTL, read32(state.stream_desc_base + SD_CTL) & ~SD_CTL_RUN);
         write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
@@ -977,11 +1261,30 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
         state.stream_bdl = .{};
     }
     state.initialized = false;
-    state.present = false;
+    @atomicStore(bool, &state.present, false, .release);
     state.dma_ready = false;
     state.playback_started = false;
-    state.next_dma_index = 0;
+    state.periods.reset();
+    state.pcm_queue.clear();
     state.backend_registered = false;
+}
+
+fn tryAcquireStream() bool {
+    return !@atomicRmw(bool, &state.stream_lock, .Xchg, true, .acq_rel);
+}
+
+fn acquireStream(ctx: *const r4os.r4dev.DriverContext, timeout_ms: u64) bool {
+    if (tryAcquireStream()) return true;
+    const deadline = ctx.tickCount() + msTicks(ctx, timeout_ms);
+    while (ctx.tickCount() < deadline) {
+        ctx.waitTicks(1);
+        if (tryAcquireStream()) return true;
+    }
+    return false;
+}
+
+fn releaseStream() void {
+    @atomicStore(bool, &state.stream_lock, false, .release);
 }
 
 fn dmaSlice(index: usize) ?[]u8 {
@@ -1148,6 +1451,11 @@ fn countBits16(value: u16) u8 {
 fn optionEnabled(ctx: *const r4os.r4dev.DriverContext, key: [*:0]const u8) bool {
     const value = ctx.getOption("HDA", key);
     return zEq(value, "1") or zEq(value, "yes") or zEq(value, "true") or zEq(value, "on");
+}
+
+fn optionDisabled(ctx: *const r4os.r4dev.DriverContext, key: [*:0]const u8) bool {
+    const value = ctx.getOption("HDA", key);
+    return zEq(value, "0") or zEq(value, "no") or zEq(value, "false") or zEq(value, "off") or zEq(value, "disabled");
 }
 
 fn zEq(z: [*:0]const u8, text: []const u8) bool {
@@ -1333,6 +1641,63 @@ fn logStreamDma(ctx: *const r4os.r4dev.DriverContext) void {
     appendText(&line, &len, " format=0x");
     appendHex(&line, &len, state.stream_format, 4);
     logLine(ctx, &line, len);
+}
+
+fn logInterruptSetup(ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [128:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.R4D interrupts mode=");
+    appendText(&line, &len, if (state.irq_mode == 2) "msi" else if (state.irq_mode == 1) "intx" else "none");
+    appendText(&line, &len, " routes=");
+    appendDec(&line, &len, state.irq_route_count);
+    appendText(&line, &len, " first=");
+    appendDec(&line, &len, state.irq_routes[0]);
+    logLine(ctx, &line, len);
+}
+
+fn logPlaybackSummary(ctx: *const r4os.r4dev.DriverContext) void {
+    if (!state.initialized and state.start_count == 0 and state.write_count == 0) return;
+    var line: [224:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.R4D playback summary irq=");
+    appendText(&line, &len, if (state.irq_mode == 2) "msi" else if (state.irq_mode == 1) "intx" else "none");
+    appendText(&line, &len, " hits=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.irq_count, .acquire));
+    appendText(&line, &len, " work=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.irq_work_submitted, .acquire));
+    appendText(&line, &len, " writes=");
+    appendDec(&line, &len, state.write_count);
+    appendText(&line, &len, " periods=");
+    appendDec(&line, &len, state.refill_count);
+    appendText(&line, &len, " underruns=");
+    appendDec(&line, &len, state.underrun_count);
+    appendText(&line, &len, " errors=");
+    appendDec(&line, &len, state.error_count + @atomicLoad(u64, &state.fifo_error_count, .acquire) + @atomicLoad(u64, &state.descriptor_error_count, .acquire) + state.queue_overflow_count + state.drain_timeout_count + state.refill_timeout_count);
+    logLine(ctx, &line, len);
+
+    var detail: [256:0]u8 = undefined;
+    len = 0;
+    appendText(&detail, &len, "HDA.R4D stream summary frames=");
+    appendDec(&detail, &len, state.converted_frame_count);
+    appendText(&detail, &len, " dropped=");
+    appendDec(&detail, &len, state.dropped_frame_count);
+    appendText(&detail, &len, " lpib=");
+    appendDec(&detail, &len, state.stream_lpib_observed);
+    appendText(&detail, &len, " bcis=");
+    appendDec(&detail, &len, @atomicLoad(u64, &state.bcis_count, .acquire));
+    appendText(&detail, &len, " fifoe=");
+    appendDec(&detail, &len, @atomicLoad(u64, &state.fifo_error_count, .acquire));
+    appendText(&detail, &len, " dese=");
+    appendDec(&detail, &len, @atomicLoad(u64, &state.descriptor_error_count, .acquire));
+    appendText(&detail, &len, " silence=");
+    appendDec(&detail, &len, state.silence_refill_count);
+    appendText(&detail, &len, " drainTimeouts=");
+    appendDec(&detail, &len, state.drain_timeout_count);
+    appendText(&detail, &len, " postroll=");
+    appendDec(&detail, &len, state.drain_postroll_period_count);
+    appendText(&detail, &len, " workDrops=");
+    appendDec(&detail, &len, @atomicLoad(u64, &state.irq_work_dropped, .acquire));
+    logLine(ctx, &detail, len);
 }
 
 fn logPlaybackReady(ctx: *const r4os.r4dev.DriverContext) void {

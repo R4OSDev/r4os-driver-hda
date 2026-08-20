@@ -1,6 +1,6 @@
 .{
     .name = .r4os_driver_hda,
-    .version = "0.1.1",
+    .version = "0.2.0",
     .fingerprint = 0x29829067d4f39064,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

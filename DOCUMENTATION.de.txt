@@ -1,22 +1,67 @@
-﻿HDA.R4D
-=======
+HDA.R4D 0.2.0
+=============
 
-Projektstruktur seit 0.51.22
---------------------------------
+HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
+Das Modul wird als R4D ueber R4DEV geladen und stellt den aktiven PCM-Backend-
+Vertrag fuer AUDSVC bereit. Der Kernel enthaelt nur gemeinsame PCI-, IRQ-,
+DMA-, Driver-Work- und Audio-Registrierungsmechanismen.
 
-Dieses Verzeichnis ist ein eigenstaendiges R4OS-SDK-Projekt fuer HDA.R4D.
+Format und Puffer
+-----------------
+Das Hardwareformat ist 48.000 Hz, Stereo, Signed 16 Bit Little Endian. Ein
+DMA-Zeitraum umfasst 480 Frames beziehungsweise 1.920 Byte und damit 10 ms.
+Sechzehn feste, 128-Byte-ausgerichtete Zeitraeume bilden den zyklischen Ring;
+die vorgeschaltete ByteQueue fasst 64 Zeitraeume.
 
-Build:
+writePcm akzeptiert beliebige gueltige frame-ausgerichtete Paketgroessen und
+konvertiert streamingfaehig in das Hardwareformat. Paketgrenzen sind keine
+BDLE-Grenzen. Vollstaendige Zeitraeume werden in freie, nicht vom Controller
+besessene Slots kopiert. Nur ein Rest beim Drain darf mit Null aufgefuellt
+werden. Hinter allen Nutzframes folgen drei getrennt gezaehlte Nullperioden,
+damit Codec- und Hostpuffer ihren Audiorest vor RUN-Clear ausgeben. Dieser
+Postroll ist keine Underrun-Recovery; kurze Normalpakete erzeugen keine Stille.
 
-    cd Code\System\Driver\HDA
-    ..\..\..\DevTools\Zig\zig.exe build
+BDL und Besitz
+--------------
+Alle 16 BDLEs, CBL und LVI werden bei geloeschtem RUN aufgebaut. Jeder BDLE
+setzt IOC. Die Tabelle bleibt waehrend RUN unveraendert. PeriodBook verwaltet
+Producer, aktuelle Hardwareperiode, Ready-Bits und Fuellstand. Ein Ready-Slot
+oder die aktive Periode darf nicht ueberschrieben werden. RUN startet nach
+allen sechzehn vorgefuellten Perioden (160 ms). Ein Drain darf auch einen
+kuerzeren, abgeschlossenen Klang mit einer Periode starten.
 
-Artefakt:
+Interrupts und Arbeit
+---------------------
+Der Treiber versucht MSI und faellt auf die gerouteten INTx-Leitungen zurueck.
+Die ISR prueft INTSTS/SD_STS, zaehlt BCIS, FIFOE und DESE, quittiert die W1C-
+Bits und plant genau eine zusammengefasste Driver-Work-Arbeit. In der ISR gibt
+es weder Allokation noch Wartefunktion, PCM-Kopie oder normalen Logstrom.
+Driver Work liest LPIB, gibt verbrauchte Perioden frei, fuellt nach und fuehrt
+eine angeforderte Recovery aus.
+Der Backendstatus aktualisiert den Besitz ebenfalls direkt aus LPIB, bevor er
+den Fuellstand meldet. Damit bleibt die Producer-Taktung auch dann korrekt,
+wenn QEMU Interruptarbeit zusammenfasst oder verspaetet ausfuehrt.
 
-    zig-out\HDA.R4D
+Unterlauf und Lebenszyklus
+--------------------------
+Ein Unterlauf entsteht nur, wenn LPIB in eine nicht vorbereitete Periode
+wechselt. Dann werden underruns und silence_refills getrennt von Upstream-
+Drops und Backendfehlern erhoeht. DESE fordert Recovery an, FIFOE bleibt ein
+sichtbarer Streamfehler.
 
-Manifest:
+Stop drainiert Nutzframes und drei Postroll-Perioden hoechstens 250 ms,
+loescht RUN und wartet mindestens mit dem zeitbasierten 10-ms-Vertrag aus
+Intel HDA033-A. Danach wird der Descriptor
+zurueckgesetzt und die unveraenderte Ringgeometrie im gestoppten Zustand neu
+programmiert. Stop, Fehler, Close und Shutdown benutzen idempotenten Abbau und
+raeumen ausstehende Driver-Work-Handles auf.
 
-    module.R4MF
+Build und Tests
+---------------
 
-Image-Zielpfad: C:\R4OS\DRIVERS\HDA.R4D
+    Build.bat test
+
+Der Schritt baut und inspiziert HDA.R4D und prueft ByteQueue, Wraparound,
+Periodenbesitz, Lueckenerkennung und Recovery. Die End-to-End-Abnahme erfolgt
+mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
+liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.
