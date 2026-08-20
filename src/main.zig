@@ -1003,7 +1003,7 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     var ctx = context();
     if (!acquireStream(&ctx, 100)) return setLastResult(-1);
     defer releaseStream();
-    stopPlayback(&ctx);
+    stopPlayback(&ctx, false);
     return setLastResult(0);
 }
 
@@ -1231,9 +1231,15 @@ fn drainPlayback(ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
-fn stopPlayback(ctx: *const r4os.r4dev.DriverContext) void {
+fn stopPlayback(ctx: *const r4os.r4dev.DriverContext, drain: bool) void {
     if (!state.dma_ready or state.stream_desc_base == 0) return;
-    drainPlayback(ctx);
+    if (drain) {
+        drainPlayback(ctx);
+    } else {
+        state.dropped_frame_count +%= state.pcm_queue.used / pcm.TARGET_FRAME_BYTES;
+        state.dropped_frame_count +%= state.periods.queued * (DMA_BUFFER_BYTES / pcm.TARGET_FRAME_BYTES);
+        state.draining = false;
+    }
     const control = read32(state.stream_desc_base + SD_CTL);
     write32(state.stream_desc_base + SD_CTL, control & ~SD_CTL_RUN);
     if (!waitRunClear(ctx)) {
@@ -1289,7 +1295,7 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
         return;
     }
     defer releaseStream();
-    stopPlayback(ctx);
+    stopPlayback(ctx, true);
     disableInterrupts();
     unregisterInterrupts(ctx);
     releaseDriverWork(ctx);
