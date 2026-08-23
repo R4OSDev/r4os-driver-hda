@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.0`
+- Version: `0.3.2`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -33,6 +33,8 @@ The driver uses sixteen fixed 10 ms DMA periods and a separate software PCM
 queue. Caller packets are joined without normal-path zero padding; BDL, CBL
 and LVI remain unchanged while RUN is set. MSI is preferred with INTx as the
 fallback, and the ISR delegates refill and recovery to bounded Driver Work.
+Stream-Close joins and releases every outstanding Driver-Work completion so
+the shared queue returns to zero retained HDA slots while idle.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`. The normative
 project-wide stream contract and reference comparison live in

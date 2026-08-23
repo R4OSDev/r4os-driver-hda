@@ -1,4 +1,4 @@
-HDA.R4D 0.3.1
+HDA.R4D 0.3.2
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -61,8 +61,10 @@ AUDSVC-Close innerhalb seines 100-ms-Vertrags. Nur Treiber-Shutdown darf
 Nutzframes und drei Postroll-Perioden hoechstens 250 ms drainieren. Beide
 Pfade warten mindestens mit dem zeitbasierten 10-ms-RUN-Clear-Vertrag aus
 Intel HDA033-A und programmieren die unveraenderte Ringgeometrie nur im
-gestoppten Zustand neu. Stop, Fehler, Close und Shutdown benutzen
-idempotenten Abbau und raeumen ausstehende Driver-Work-Handles auf.
+gestoppten Zustand neu. Nach Freigabe des Stream-Locks joint Stream-Close
+ausstehende Refill-Arbeit und gibt auch die letzte retained Completion frei.
+Stop, Fehler, Close und Shutdown benutzen idempotenten Abbau und raeumen
+ausstehende Driver-Work-Handles auf.
 
 Build und Tests
 ---------------

@@ -1002,8 +1002,9 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
     if (!acquireStream(&ctx, 100)) return setLastResult(-1);
-    defer releaseStream();
     stopPlayback(&ctx, false);
+    releaseStream();
+    releaseDriverWork(&ctx);
     return setLastResult(0);
 }
 
