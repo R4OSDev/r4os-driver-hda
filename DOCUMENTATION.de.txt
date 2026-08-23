@@ -1,4 +1,4 @@
-HDA.R4D 0.3.2
+HDA.R4D 0.3.3
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -13,6 +13,8 @@ DMA-Zeitraum umfasst 480 Frames beziehungsweise 1.920 Byte und damit 10 ms.
 64 feste, 128-Byte-ausgerichtete Zeitraeume bilden in einer zusammenhaengenden
 DMA-Allokation den zyklischen Ring; die vorgeschaltete ByteQueue fasst
 ebenfalls 64 Zeitraeume.
+Wenn GCAP keine 64-Bit-Adressierung meldet, fordert der Treiber BDL und Ring
+explizit unterhalb von 4 GiB an; physische Adressen werden nie abgeschnitten.
 
 writePcm akzeptiert gueltige frame-ausgerichtete Paketgroessen bis zur
 32-Perioden-Sollreserve und meldet danach nichtblockierend Busy. Es
@@ -41,6 +43,9 @@ Bits und plant genau eine zusammengefasste Driver-Work-Arbeit. In der ISR gibt
 es weder Allokation noch Wartefunktion, PCM-Kopie oder normalen Logstrom.
 Driver Work liest LPIB, gibt verbrauchte Perioden frei, fuellt nach und fuehrt
 eine angeforderte Recovery aus.
+Eine monotone IRQ-Generation schliesst das Abschlussfenster eines Refill-Jobs:
+waehrend des Durchlaufs eingetroffene Arbeit wird vom aktuellen Worker erneut
+uebernommen oder gehoert bereits einem nachfolgenden Worker.
 Der Backendstatus aktualisiert den Besitz ebenfalls direkt aus LPIB, bevor er
 den Fuellstand meldet. Damit bleibt die Producer-Taktung auch dann korrekt,
 wenn QEMU Interruptarbeit zusammenfasst oder verspaetet ausfuehrt.
@@ -58,7 +63,7 @@ gestoppt und zurueckgesetzt; alter Ringinhalt kann nicht wiederholt werden.
 Ein normaler Stream-Close verwirft noch gepufferte Frames, loescht RUN und
 setzt den Descriptor sofort kontrolliert zurueck. Dadurch bleibt der synchrone
 AUDSVC-Close innerhalb seines 100-ms-Vertrags. Nur Treiber-Shutdown darf
-Nutzframes und drei Postroll-Perioden hoechstens 250 ms drainieren. Beide
+Nutzframes und drei Postroll-Perioden hoechstens 400 ms drainieren. Beide
 Pfade warten mindestens mit dem zeitbasierten 10-ms-RUN-Clear-Vertrag aus
 Intel HDA033-A und programmieren die unveraenderte Ringgeometrie nur im
 gestoppten Zustand neu. Nach Freigabe des Stream-Locks joint Stream-Close
@@ -66,12 +71,18 @@ ausstehende Refill-Arbeit und gibt auch die letzte retained Completion frei.
 Stop, Fehler, Close und Shutdown benutzen idempotenten Abbau und raeumen
 ausstehende Driver-Work-Handles auf.
 
+Beim Treiberabbau gilt strikt: Stream stoppen, Interruptquelle sperren,
+IRQ/MSI abmelden, Driver Work joinen, erst dann DMA freigeben und das
+Audio-Backend entfernen. Scheitert ein Sicherheitsnachweis, bleibt der Owner
+mit seinen Ressourcen quarantainisiert.
+
 Build und Tests
 ---------------
 
     Build.bat test
 
 Der Schritt baut und inspiziert HDA.R4D und prueft ByteQueue, Wraparound,
-Periodenbesitz, Lueckenerkennung und Recovery. Die End-to-End-Abnahme erfolgt
+Periodenbesitz, Lueckenerkennung, Recovery und den IRQ-Generation-Gate. Die
+End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.

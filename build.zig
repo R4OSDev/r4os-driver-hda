@@ -19,7 +19,16 @@ pub fn build(b: *std.Build) void {
     const ring_tests = b.addTest(.{ .root_module = ring_tests_module });
     const run_ring_tests = b.addRunArtifact(ring_tests);
 
+    const work_gate_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/work_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const work_gate_tests = b.addTest(.{ .root_module = work_gate_tests_module });
+    const run_work_gate_tests = b.addRunArtifact(work_gate_tests);
+
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ring_tests.step);
+    test_step.dependOn(&run_work_gate_tests.step);
 }
