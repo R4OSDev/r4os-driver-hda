@@ -1035,7 +1035,7 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
     if (!acquireStream(&ctx, 100)) return setLastResult(-1);
-    const stopped = stopPlayback(&ctx, false);
+    const stopped = stopPlayback(&ctx, true);
     releaseStream();
     if (!stopped) return setLastResult(-1);
     if (!releaseDriverWork(&ctx)) return setLastResult(-1);
@@ -1231,8 +1231,8 @@ fn startPlaybackIfNeeded() void {
     updateStreamStatus();
 }
 
-fn drainPlayback(ctx: *const r4os.r4dev.DriverContext) void {
-    if (!state.playback_started and state.periods.queued == 0 and state.pcm_queue.used == 0) return;
+fn drainPlayback(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (!state.playback_started and state.periods.queued == 0 and state.pcm_queue.used == 0) return true;
     state.drain_count += 1;
     state.draining = true;
     const start_tick = ctx.tickCount();
@@ -1263,12 +1263,13 @@ fn drainPlayback(ctx: *const r4os.r4dev.DriverContext) void {
         state.drain_timeout_count += 1;
         noteHdaWarn(ctx, "drain timeout");
     }
+    return drained;
 }
 
 fn stopPlayback(ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
     if (!state.dma_ready or state.stream_desc_base == 0) return true;
     if (drain) {
-        drainPlayback(ctx);
+        if (!drainPlayback(ctx)) return false;
     } else {
         state.dropped_frame_count +%= state.pcm_queue.used / pcm.TARGET_FRAME_BYTES;
         state.dropped_frame_count +%= state.periods.queued * (DMA_BUFFER_BYTES / pcm.TARGET_FRAME_BYTES);
