@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.2`
+- Version: `0.3.6`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -18,7 +18,7 @@ On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
@@ -29,11 +29,12 @@ mapped local checkouts.
 
 ## Documentation
 
-The driver uses sixteen fixed 10 ms DMA periods and a separate software PCM
-queue. Caller packets are joined without normal-path zero padding; BDL, CBL
+The driver uses a 64-period DMA ring, starts after two ready 10 ms periods,
+and has a separate software PCM queue. Caller packets are joined without
+normal-path zero padding; BDL, CBL
 and LVI remain unchanged while RUN is set. MSI is preferred with INTx as the
 fallback, and the ISR delegates refill and recovery to bounded Driver Work.
-Stream-Close joins and releases every outstanding Driver-Work completion so
+Stream-Close drains short tails and joins every outstanding Driver-Work completion so
 the shared queue returns to zero retained HDA slots while idle.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`. The normative

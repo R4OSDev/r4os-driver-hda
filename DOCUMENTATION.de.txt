@@ -1,4 +1,4 @@
-HDA.R4D 0.3.3
+HDA.R4D 0.3.6
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -21,7 +21,10 @@ writePcm akzeptiert gueltige frame-ausgerichtete Paketgroessen bis zur
 konvertiert streamingfaehig in das Hardwareformat. Paketgrenzen sind keine
 BDLE-Grenzen. Vollstaendige Zeitraeume werden in freie, nicht vom Controller
 besessene Slots kopiert. Nur ein Rest beim Drain darf mit Null aufgefuellt
-werden. Hinter allen Nutzframes folgen drei getrennt gezaehlte Nullperioden,
+werden. Ein normaler Start benoetigt zwei vollstaendige Perioden und hat damit
+eine Startreserve von 20 ms; ein Drain darf bereits eine einzelne aufgefuellte
+Restperiode starten. Hinter allen Nutzframes folgen drei getrennt gezaehlte
+Nullperioden,
 damit Codec- und Hostpuffer ihren Audiorest vor RUN-Clear ausgeben. Dieser
 Postroll ist keine Underrun-Recovery; kurze Normalpakete erzeugen keine Stille.
 
@@ -31,9 +34,9 @@ Alle 64 BDLEs, CBL und LVI werden bei geloeschtem RUN aufgebaut. Jeder BDLE
 setzt IOC. Die Tabelle bleibt waehrend RUN unveraendert. PeriodBook verwaltet
 Producer, aktuelle Hardwareperiode, Ready-Bits und Fuellstand. Ein Ready-Slot
 oder die aktive Periode darf nicht ueberschrieben werden. RUN startet nach
-sechzehn vorgefuellten Perioden (160 ms); danach darf die laufende Reserve
-bis 32 Perioden (320 ms) wachsen. Ein Drain darf auch einen kuerzeren,
-abgeschlossenen Klang mit einer Periode starten.
+zwei vorgefuellten Perioden (20 ms); danach darf die laufende Reserve bis 32
+Perioden (320 ms) wachsen. Ein Drain darf auch einen kuerzeren, abgeschlossenen
+Klang mit einer Periode starten.
 
 Interrupts und Arbeit
 ---------------------
@@ -60,11 +63,10 @@ hinter die aktuelle Hardwareperiode gesetzt. Bleibt jede Positionsbeobachtung
 fuer ein komplettes 640-ms-DMA-Fenster aus, wird der Descriptor kontrolliert
 gestoppt und zurueckgesetzt; alter Ringinhalt kann nicht wiederholt werden.
 
-Ein normaler Stream-Close verwirft noch gepufferte Frames, loescht RUN und
-setzt den Descriptor sofort kontrolliert zurueck. Dadurch bleibt der synchrone
-AUDSVC-Close innerhalb seines 100-ms-Vertrags. Nur Treiber-Shutdown darf
-Nutzframes und drei Postroll-Perioden hoechstens 400 ms drainieren. Beide
-Pfade warten mindestens mit dem zeitbasierten 10-ms-RUN-Clear-Vertrag aus
+Ein normaler Stream-Close und der Treiber-Shutdown drainieren verbleibende
+Nutzframes sowie drei Postroll-Perioden hoechstens 400 ms. Erst danach wird
+RUN geloescht und der Descriptor kontrolliert zurueckgesetzt. Beide Pfade
+warten mindestens mit dem zeitbasierten 10-ms-RUN-Clear-Vertrag aus
 Intel HDA033-A und programmieren die unveraenderte Ringgeometrie nur im
 gestoppten Zustand neu. Nach Freigabe des Stream-Locks joint Stream-Close
 ausstehende Refill-Arbeit und gibt auch die letzte retained Completion frei.
@@ -80,9 +82,11 @@ Build und Tests
 ---------------
 
     Build.bat test
+    ./Build.sh test
 
 Der Schritt baut und inspiziert HDA.R4D und prueft ByteQueue, Wraparound,
-Periodenbesitz, Lueckenerkennung, Recovery und den IRQ-Generation-Gate. Die
+Startreserve, Periodenbesitz, Lueckenerkennung, Recovery und den
+IRQ-Generation-Gate. Die
 End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.

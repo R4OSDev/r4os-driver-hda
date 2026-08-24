@@ -1,5 +1,10 @@
 pub const maximum_periods: usize = 256;
 
+pub fn readyToStart(queued_periods: usize, prefill_periods: usize, draining: bool) bool {
+    const minimum = if (draining) @as(usize, 1) else prefill_periods;
+    return queued_periods >= minimum;
+}
+
 pub const ByteQueue = struct {
     read_pos: usize = 0,
     write_pos: usize = 0,
@@ -147,6 +152,15 @@ test "byte queue rejects a partial write" {
     var queue: ByteQueue = .{};
     try std.testing.expect(!queue.writeAll(&storage, "12345"));
     try std.testing.expectEqual(@as(usize, 0), queue.used);
+}
+
+test "playback starts after low-latency prefill or one draining period" {
+    const std = @import("std");
+    try std.testing.expect(!readyToStart(0, 2, false));
+    try std.testing.expect(!readyToStart(1, 2, false));
+    try std.testing.expect(readyToStart(2, 2, false));
+    try std.testing.expect(!readyToStart(0, 2, true));
+    try std.testing.expect(readyToStart(1, 2, true));
 }
 
 test "period book keeps producer off the active hardware period" {

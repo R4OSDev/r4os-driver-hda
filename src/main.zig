@@ -59,7 +59,7 @@ const DMA_BUFFER_COUNT: usize = 64;
 const DMA_BUFFER_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
 const DMA_RING_BYTES: usize = DMA_BUFFER_COUNT * DMA_BUFFER_BYTES;
 const PCM_QUEUE_BYTES: usize = DMA_BUFFER_BYTES * 64;
-const PREFILL_PERIODS: usize = 16;
+const PREFILL_PERIODS: usize = 2;
 const BUFFER_TARGET_PERIODS: usize = 32;
 const DMA_WINDOW_MS: u64 = DMA_BUFFER_COUNT * 10;
 const DRAIN_POSTROLL_PERIODS: usize = 3;
@@ -1226,8 +1226,7 @@ fn currentDmaSlot() usize {
 
 fn startPlaybackIfNeeded() void {
     if (state.playback_started) return;
-    const minimum = if (state.draining) @as(usize, 1) else PREFILL_PERIODS;
-    if (state.periods.queued < minimum or !state.periods.start(0)) return;
+    if (!stream_ring.readyToStart(state.periods.queued, PREFILL_PERIODS, state.draining) or !state.periods.start(0)) return;
     const stream_bits: u32 = @as(u32, state.output_stream_id & 0x0F) << SD_CTL_STREAM_SHIFT;
     write32(state.stream_desc_base + SD_CTL, stream_bits | SD_CTL_IRQ_ENABLE | SD_CTL_RUN);
     state.playback_started = true;
@@ -1402,7 +1401,7 @@ fn dmaSlice(index: usize) ?[]u8 {
 
 fn setLastResult(result: i32) i32 {
     state.last_result = result;
-    if (result < 0) state.error_count += 1;
+    if (result < 0 and result != r4os.abi.service_api_result_busy) state.error_count += 1;
     return result;
 }
 
