@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.6`
+- Version: `0.3.7`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -34,8 +34,12 @@ and has a separate software PCM queue. Caller packets are joined without
 normal-path zero padding; BDL, CBL
 and LVI remain unchanged while RUN is set. MSI is preferred with INTx as the
 fallback, and the ISR delegates refill and recovery to bounded Driver Work.
-Stream-Close drains short tails and joins every outstanding Driver-Work completion so
-the shared queue returns to zero retained HDA slots while idle.
+Each pass declares a 10 ms deadline, a stable HDA key, and a bounded callback
+budget on the isolated DriverApi-v20 audio lane. A callback performs one pass
+and submits at most one freshly deadline-stamped successor. Stream-Close
+drains short tails and joins every outstanding Driver-Work completion after
+releasing the stream lock, so the shared queue returns to zero retained HDA
+slots while idle.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`. The normative
 project-wide stream contract and reference comparison live in

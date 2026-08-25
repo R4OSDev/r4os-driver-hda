@@ -65,6 +65,8 @@ const DMA_WINDOW_MS: u64 = DMA_BUFFER_COUNT * 10;
 const DRAIN_POSTROLL_PERIODS: usize = 3;
 const IRQ_ROUTE_CAPACITY: usize = 9;
 const WORK_HANDLE_CAPACITY: usize = 2;
+const REFILL_DEADLINE_MS: u64 = 10;
+const REFILL_BUDGET_MS: u64 = 2;
 const HDA_BDL_IOC: u32 = 0x0000_0001;
 const HDA_FORMAT_BASE_48K: u16 = 0 << 14;
 const HDA_FORMAT_BITS_16: u16 = 1 << 4;
@@ -865,8 +867,17 @@ fn scheduleRefillWork(s: *State) void {
         return;
     };
 
+    const budget_ticks = @min(r4os.abi.driver_work_deadline_max_budget_ticks, msTicks(&ctx, REFILL_BUDGET_MS));
+    const request = r4os.abi.DriverWorkRequest{
+        .handler = refillWork,
+        .context = @intFromPtr(s),
+        .flags = r4os.abi.driver_work_flag_from_irq,
+        .serial_key = @intFromPtr(s),
+        .deadline_tick = ctx.tickCount() +| msTicks(&ctx, REFILL_DEADLINE_MS),
+        .budget_ticks = @max(@as(u64, 1), budget_ticks),
+    };
     var handle: u32 = 0;
-    if (ctx.workSubmit(refillWork, @intFromPtr(s), r4os.abi.driver_work_flag_from_irq, &handle) != 0 or handle == 0) {
+    if (ctx.workSubmitRequest(&request, &handle) != 0 or handle == 0) {
         _ = @atomicRmw(u64, &s.irq_work_dropped, .Add, 1, .acq_rel);
         @atomicStore(bool, &s.work_pending, false, .release);
         return;
@@ -879,25 +890,21 @@ fn refillWork(raw_context: usize) callconv(.c) i32 {
     const s: *State = @ptrFromInt(raw_context);
     const ctx = r4os.r4dev.DriverContext.init(s.api);
     releaseCompletedWork(&ctx);
-    var observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
-    while (true) {
-        if (!@atomicLoad(bool, &s.shutting_down, .acquire)) {
-            if (tryAcquireStream()) {
-                defer releaseStream();
-                if (@atomicRmw(bool, &s.recovery_pending, .Xchg, false, .acq_rel)) {
-                    _ = recoverStream(&ctx, "descriptor error");
-                } else {
-                    refreshPlaybackPosition(&ctx);
-                    fillDmaPeriods(&ctx);
-                    startPlaybackIfNeeded();
-                }
+    const observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
+    if (!@atomicLoad(bool, &s.shutting_down, .acquire)) {
+        if (tryAcquireStream()) {
+            defer releaseStream();
+            if (@atomicRmw(bool, &s.recovery_pending, .Xchg, false, .acq_rel)) {
+                _ = recoverStream(&ctx, "descriptor error");
+            } else {
+                refreshPlaybackPosition(&ctx);
+                fillDmaPeriods(&ctx);
+                startPlaybackIfNeeded();
             }
         }
-        switch (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down)) {
-            .reclaimed => observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire),
-            .stop, .delegated => return 0,
-        }
     }
+    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down) == .resubmit) scheduleRefillWork(s);
+    return 0;
 }
 
 fn releaseCompletedWork(ctx: *const r4os.r4dev.DriverContext) void {
@@ -1331,16 +1338,18 @@ fn recoverStream(ctx: *const r4os.r4dev.DriverContext, reason: [*:0]const u8) bo
 
 fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
     @atomicStore(bool, &state.shutting_down, true, .release);
-    if (!acquireStream(ctx, 100)) {
-        noteHdaWarn(ctx, "shutdown stream lock timeout");
-        return false;
-    }
-    defer releaseStream();
-    if (!stopPlayback(ctx, true)) return false;
-    disableInterrupts();
-    if (!unregisterInterrupts(ctx)) {
-        noteHdaWarn(ctx, "shutdown MSI disable failed");
-        return false;
+    {
+        if (!acquireStream(ctx, 100)) {
+            noteHdaWarn(ctx, "shutdown stream lock timeout");
+            return false;
+        }
+        defer releaseStream();
+        if (!stopPlayback(ctx, true)) return false;
+        disableInterrupts();
+        if (!unregisterInterrupts(ctx)) {
+            noteHdaWarn(ctx, "shutdown MSI disable failed");
+            return false;
+        }
     }
     if (!releaseDriverWork(ctx)) {
         noteHdaWarn(ctx, "shutdown work quiesce failed");

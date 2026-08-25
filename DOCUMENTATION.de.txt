@@ -1,4 +1,4 @@
-HDA.R4D 0.3.6
+﻿HDA.R4D 0.3.7
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -44,11 +44,17 @@ Der Treiber versucht MSI und faellt auf die gerouteten INTx-Leitungen zurueck.
 Die ISR prueft INTSTS/SD_STS, zaehlt BCIS, FIFOE und DESE, quittiert die W1C-
 Bits und plant genau eine zusammengefasste Driver-Work-Arbeit. In der ISR gibt
 es weder Allokation noch Wartefunktion, PCM-Kopie oder normalen Logstrom.
-Driver Work liest LPIB, gibt verbrauchte Perioden frei, fuellt nach und fuehrt
-eine angeforderte Recovery aus.
+DriverApi v20 uebergibt den Refill als absolute 10-ms-Deadline mit stabilem
+HDA-Geraeteschluessel und einem aus 2 ms abgeleiteten, auf hoechstens vier
+Ticks begrenzten Callbackbudget. Die Anforderung laeuft auf der getrennten
+EDF-Queue und dem einzelnen `r4d-audio`-Short-Completion-Worker statt in der
+normalen Driver-FIFO. Driver Work liest LPIB, gibt verbrauchte Perioden frei,
+fuellt nach und fuehrt eine angeforderte Recovery aus.
 Eine monotone IRQ-Generation schliesst das Abschlussfenster eines Refill-Jobs:
-waehrend des Durchlaufs eingetroffene Arbeit wird vom aktuellen Worker erneut
-uebernommen oder gehoert bereits einem nachfolgenden Worker.
+Jeder Callback fuehrt genau einen begrenzten Durchlauf aus; waehrenddessen
+eingetroffene Arbeit erhaelt einen neuen Successor mit eigener Deadline oder
+gehoert bereits dem vom IRQ aufgenommenen Successor. Pro HDA ist hoechstens
+ein solcher Nachfolger gequeued.
 Der Backendstatus aktualisiert den Besitz ebenfalls direkt aus LPIB, bevor er
 den Fuellstand meldet. Damit bleibt die Producer-Taktung auch dann korrekt,
 wenn QEMU Interruptarbeit zusammenfasst oder verspaetet ausfuehrt.
@@ -74,9 +80,14 @@ Stop, Fehler, Close und Shutdown benutzen idempotenten Abbau und raeumen
 ausstehende Driver-Work-Handles auf.
 
 Beim Treiberabbau gilt strikt: Stream stoppen, Interruptquelle sperren,
-IRQ/MSI abmelden, Driver Work joinen, erst dann DMA freigeben und das
+IRQ/MSI abmelden, Stream-Lock freigeben, Driver Work joinen, erst dann DMA
+freigeben und das
 Audio-Backend entfernen. Scheitert ein Sicherheitsnachweis, bleibt der Owner
 mit seinen Ressourcen quarantainisiert.
+
+Die 64x10-ms-Ringgeometrie und die zusammenhaengende DMA-Allokation bleiben
+unveraendert. Cursor-, Queue-, Unterlauf- und Deadlinewerte belegen aktuell
+keinen Nutzen einer Perioden- oder Segment-DMA-Aenderung.
 
 Build und Tests
 ---------------
@@ -86,7 +97,7 @@ Build und Tests
 
 Der Schritt baut und inspiziert HDA.R4D und prueft ByteQueue, Wraparound,
 Startreserve, Periodenbesitz, Lueckenerkennung, Recovery und den
-IRQ-Generation-Gate. Die
+IRQ-Generation-Gate mit genau einem Durchlauf und neuem Successor. Die
 End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.
