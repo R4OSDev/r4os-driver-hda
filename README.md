@@ -4,13 +4,23 @@
 
 ## Package
 
-- Version: `0.3.7`
+- Version: `0.3.8`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+HDA 0.3.8 enumerates every bounded PCI class-04/03 candidate and selects a
+complete analog-capable controller from codec evidence instead of accepting
+the first function. Each candidate follows an explicit quiesce/reset/
+STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
+ring sizes, codec-matched responses and monotone timeouts. Immediate Commands
+are used only when `OPTION HDA immediate=on` explicitly enables the visible
+fallback; `OPTION HDA corb=off` can be combined with it for diagnostics.
+Discovery covers all 15 codec addresses, every advertised audio function
+group and the complete valid eight-bit node space without silent truncation.
 
 ## Build
 

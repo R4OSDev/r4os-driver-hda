@@ -2,6 +2,10 @@ const r4os = @import("r4os");
 const pcm = r4os.audio_pcm;
 const stream_ring = @import("stream_ring.zig");
 const work_gate = @import("work_gate.zig");
+const controller_policy = @import("controller_policy.zig");
+const controller_reset = @import("controller_reset.zig");
+const command_ring = @import("command_ring.zig");
+const codec_inventory = @import("codec_inventory.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("hda_init", "hda_shutdown"));
@@ -19,6 +23,20 @@ const REG_GCTL: u64 = 0x08;
 const REG_STATESTS: u64 = 0x0E;
 const REG_INTCTL: u64 = 0x20;
 const REG_INTSTS: u64 = 0x24;
+const REG_CORBLBASE: u64 = 0x40;
+const REG_CORBUBASE: u64 = 0x44;
+const REG_CORBWP: u64 = 0x48;
+const REG_CORBRP: u64 = 0x4A;
+const REG_CORBCTL: u64 = 0x4C;
+const REG_CORBSTS: u64 = 0x4D;
+const REG_CORBSIZE: u64 = 0x4E;
+const REG_RIRBLBASE: u64 = 0x50;
+const REG_RIRBUBASE: u64 = 0x54;
+const REG_RIRBWP: u64 = 0x58;
+const REG_RINTCNT: u64 = 0x5A;
+const REG_RIRBCTL: u64 = 0x5C;
+const REG_RIRBSTS: u64 = 0x5D;
+const REG_RIRBSIZE: u64 = 0x5E;
 const REG_ICOI: u64 = 0x60;
 const REG_ICII: u64 = 0x64;
 const REG_ICIS: u64 = 0x68;
@@ -38,6 +56,15 @@ const GCTL_CRST: u32 = 0x0000_0001;
 const INTCTL_GIE: u32 = 0x8000_0000;
 const ICIS_BUSY: u16 = 0x0001;
 const ICIS_VALID: u16 = 0x0002;
+const CORBRP_RESET: u16 = 0x8000;
+const CORBCTL_RUN: u8 = 0x02;
+const CORBSTS_MEMORY_ERROR: u8 = 0x01;
+const RIRBWP_RESET: u16 = 0x8000;
+const RIRBCTL_RESPONSE_ENABLE: u8 = 0x01;
+const RIRBCTL_DMA_ENABLE: u8 = 0x02;
+const RIRBSTS_RESPONSE: u8 = 0x01;
+const RIRBSTS_OVERRUN: u8 = 0x04;
+const RIRBSTS_CLEAR: u8 = RIRBSTS_RESPONSE | RIRBSTS_OVERRUN;
 const SD_CTL_SRST: u32 = 0x0000_0001;
 const SD_CTL_RUN: u32 = 0x0000_0002;
 const SD_CTL_IOCE: u32 = 0x0000_0004;
@@ -50,11 +77,10 @@ const SD_STS_FIFOE: u8 = 0x08;
 const SD_STS_DESE: u8 = 0x10;
 const SD_STS_CLEAR: u8 = SD_STS_BCIS | SD_STS_FIFOE | SD_STS_DESE;
 
-const RESET_GUARD: u32 = 10_000;
-const COMMAND_GUARD: u32 = 10_000;
 const STREAM_GUARD: u32 = 10_000;
-const MAX_CODECS: usize = 4;
-const MAX_WIDGETS: usize = 48;
+const MAX_CONTROLLER_CANDIDATES: usize = 64;
+const MAX_CODECS: usize = codec_inventory.max_codec_addresses;
+const MAX_CODEC_NODES: usize = codec_inventory.max_nodes;
 const DMA_BUFFER_COUNT: usize = 64;
 const DMA_BUFFER_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
 const DMA_RING_BYTES: usize = DMA_BUFFER_COUNT * DMA_BUFFER_BYTES;
@@ -84,6 +110,10 @@ const MAX_RATE: u32 = 192_000;
 // schlechtesten regulaeren Fall 360 ms. Der Shutdown erhaelt etwas Reserve.
 const DRAIN_WAIT_MS: u64 = 400;
 const RUN_CLEAR_TIMEOUT_MS: u64 = 10;
+const RESET_TIMEOUT_MS: u64 = 100;
+const CODEC_WAKE_TIMEOUT_MS: u64 = 100;
+const COMMAND_DMA_STOP_TIMEOUT_MS: u64 = 100;
+const COMMAND_TIMEOUT_MS: u64 = 100;
 comptime {
     if (DRAIN_WAIT_MS < (BUFFER_TARGET_PERIODS + 1 + DRAIN_POSTROLL_PERIODS) * 10) {
         @compileError("HDA drain deadline must cover target queue, tail and postroll");
@@ -97,6 +127,7 @@ const PARAM_FUNCTION_GROUP_TYPE: u8 = 0x05;
 const PARAM_AUDIO_WIDGET_CAPS: u8 = 0x09;
 const PARAM_PIN_CAPS: u8 = 0x0C;
 const PARAM_CONNECTION_LIST_LENGTH: u8 = 0x0E;
+const VERB_GET_CONFIG_DEFAULT: u16 = 0xF1C;
 const FUNCTION_GROUP_AUDIO: u8 = 0x01;
 const WIDGET_AUDIO_OUTPUT: u8 = 0x00;
 const WIDGET_AUDIO_MIXER: u8 = 0x02;
@@ -109,6 +140,16 @@ const PIN_CONTROL_OUT_ENABLE: u8 = 0x40;
 const EAPD_BTL_ENABLE: u8 = 0x02;
 const FIRST_STREAM_ID: u8 = 1;
 const FIRST_CHANNEL_ID: u8 = 0;
+const PIN_DEFAULT_DEVICE_SHIFT: u5 = 20;
+const PIN_DEFAULT_DEVICE_MASK: u32 = 0x0F;
+const PIN_DEFAULT_CONNECTIVITY_SHIFT: u5 = 30;
+const PIN_DEFAULT_CONNECTIVITY_MASK: u32 = 0x03;
+const PIN_CONNECTIVITY_NONE: u8 = 1;
+const PIN_DEVICE_LINE_OUT: u8 = 0;
+const PIN_DEVICE_SPEAKER: u8 = 1;
+const PIN_DEVICE_HEADPHONE: u8 = 2;
+const PIN_DEVICE_SPDIF_OUT: u8 = 4;
+const PIN_DEVICE_DIGITAL_OTHER_OUT: u8 = 5;
 
 const InitStage = enum(u8) {
     none,
@@ -123,11 +164,20 @@ const InitStage = enum(u8) {
     failed,
 };
 
+const TransportMode = enum(u8) {
+    none,
+    corb_rirb,
+    immediate,
+};
+
 const WidgetInfo = struct {
+    present: bool = false,
     node: u8 = 0,
+    afg_node: u8 = 0,
     kind: u8 = 0xFF,
     caps: u32 = 0,
     pin_caps: u32 = 0,
+    pin_config: u32 = 0,
 };
 
 const CodecInfo = struct {
@@ -138,14 +188,16 @@ const CodecInfo = struct {
     root_start: u8 = 0,
     root_count: u8 = 0,
     afg_node: u8 = 0,
-    afg_widgets_start: u8 = 0,
-    afg_widgets_count: u8 = 0,
-    discovered_widgets: u8 = 0,
-    output_count: u8 = 0,
-    pin_count: u8 = 0,
-    mixer_count: u8 = 0,
-    selector_count: u8 = 0,
-    widgets: [MAX_WIDGETS]WidgetInfo = .{WidgetInfo{}} ** MAX_WIDGETS,
+    afg_count: u16 = 0,
+    afg_nodes: [MAX_CODEC_NODES]u8 = .{0} ** MAX_CODEC_NODES,
+    discovered_widgets: u16 = 0,
+    output_count: u16 = 0,
+    analog_output_pin_count: u16 = 0,
+    digital_output_pin_count: u16 = 0,
+    pin_count: u16 = 0,
+    mixer_count: u16 = 0,
+    selector_count: u16 = 0,
+    widgets: [MAX_CODEC_NODES]WidgetInfo = .{WidgetInfo{}} ** MAX_CODEC_NODES,
 };
 
 const OutputCandidate = struct {
@@ -157,6 +209,7 @@ const OutputCandidate = struct {
     pin: u8 = 0,
     pin_widget_caps: u32 = 0,
     pin_caps: u32 = 0,
+    pin_config: u32 = 0,
 };
 
 const BdlEntry = extern struct {
@@ -165,11 +218,19 @@ const BdlEntry = extern struct {
     flags: u32 = 0,
 };
 
+const RirbEntry = extern struct {
+    response: u32 = 0,
+    extended: u32 = 0,
+};
+
 const State = struct {
     api: *const r4os.r4dev.DriverApi = undefined,
     initialized: bool = false,
     info: r4os.abi.PciDeviceInfo = .{},
     mmio: r4os.abi.MmioRegion = .{},
+    controller_candidate_count: u8 = 0,
+    controller_rejected_count: u8 = 0,
+    selected_inventory_index: u32 = ~@as(u32, 0),
     backend: r4os.abi.AudioBackend = .{},
     backend_registered: bool = false,
     present: bool = false,
@@ -194,10 +255,21 @@ const State = struct {
     discovered_codec_count: u8 = 0,
     command_count: u64 = 0,
     response_count: u64 = 0,
+    unsolicited_response_count: u64 = 0,
+    mismatched_response_count: u64 = 0,
     timeout_count: u64 = 0,
     reset_requested: bool = false,
     reset_done: bool = false,
     transport_ready: bool = false,
+    transport_mode: TransportMode = .none,
+    transport_fallback_count: u64 = 0,
+    transport_error_count: u64 = 0,
+    corb: r4os.abi.DmaBuffer = .{},
+    rirb: r4os.abi.DmaBuffer = .{},
+    corb_entries: u16 = 0,
+    rirb_entries: u16 = 0,
+    corb_write_pointer: u16 = 0,
+    rirb_read_pointer: u16 = 0,
     codec_ready: bool = false,
     output: OutputCandidate = .{},
     output_path_ok: bool = false,
@@ -310,56 +382,11 @@ export fn hda_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
         return -10;
     }
 
-    state.stage = .pci;
-    const info = findDevice(&ctx) orelse {
-        ctx.logWarn("HDA.R4D device not found");
-        failStage(.pci);
-        return -1;
-    };
-    state.info = info;
-    logDevice(&ctx, info);
-
-    if (ctx.pciEnableBusMaster(info, r4os.abi.pci_enable_memory_space) != 0) {
-        ctx.logError("HDA.R4D bus master enable failed");
-        failStage(.pci);
-        return -2;
+    if (!selectAndInitializeController(&ctx)) {
+        ctx.logError("HDA.R4D no complete analog controller candidate");
+        if (state.failed_stage == .none) failStage(.pci);
+        return initFailureCode(state.failed_stage);
     }
-
-    state.stage = .mmio;
-    if (ctx.pciMapBar(info, 0, 4096, 0, &state.mmio) != 0 or state.mmio.virt_addr == 0) {
-        ctx.logError("HDA.R4D MMIO map failed");
-        failStage(.mmio);
-        return -3;
-    }
-    readGlobalRegisters();
-    logMmio(&ctx);
-
-    state.stage = .reset;
-    state.reset_requested = optionEnabled(&ctx, "r4d_reset") or (state.gctl & GCTL_CRST) == 0;
-    if (state.reset_requested) {
-        if (!resetController(&ctx)) {
-            ctx.logError("HDA.R4D reset failed");
-            failStage(.reset);
-            return -4;
-        }
-        state.reset_done = true;
-        readGlobalRegisters();
-    }
-
-    state.stage = .transport;
-    if (!setupImmediateTransport(&ctx)) {
-        ctx.logError("HDA.R4D immediate command path failed");
-        failStage(.transport);
-        return -5;
-    }
-
-    state.stage = .codec;
-    if (!discoverCodecs(&ctx)) {
-        ctx.logError("HDA.R4D codec discovery failed");
-        failStage(.codec);
-        return -6;
-    }
-    chooseOutputCandidate(&ctx);
 
     state.stage = .output;
     if (!configureOutputPath(&ctx)) {
@@ -405,11 +432,187 @@ export fn hda_shutdown() callconv(.c) i32 {
     return if (unregisterPlaybackBackend(&ctx)) 0 else -2;
 }
 
-fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
-    var info: r4os.abi.PciDeviceInfo = .{};
-    const found = ctx.pciFindByClass(CLASS_MULTIMEDIA, SUBCLASS_HDA, 0, &info);
-    if (found < 0) return null;
-    return info;
+fn selectAndInitializeController(ctx: *const r4os.r4dev.DriverContext) bool {
+    var best_info: ?r4os.abi.PciDeviceInfo = null;
+    var best_evidence: ?controller_policy.Evidence = null;
+    var start_index: u32 = 0;
+    var candidate_count: usize = 0;
+
+    while (start_index < ctx.pciDeviceCount()) {
+        var info: r4os.abi.PciDeviceInfo = .{};
+        const found = ctx.pciFindByClass(CLASS_MULTIMEDIA, SUBCLASS_HDA, start_index, &info);
+        if (found < 0) break;
+        const inventory_index: u32 = @intCast(found);
+        if (inventory_index < start_index) {
+            ctx.logError("HDA.R4D PCI enumeration did not advance");
+            failStage(.pci);
+            return false;
+        }
+        start_index = inventory_index + 1;
+        if (candidate_count >= MAX_CONTROLLER_CANDIDATES) {
+            ctx.logError("HDA.R4D controller candidate capacity exceeded");
+            failStage(.pci);
+            return false;
+        }
+        candidate_count += 1;
+        state.controller_candidate_count = @intCast(candidate_count);
+
+        const evidence = probeControllerCandidate(ctx, info, inventory_index);
+        logControllerCandidate(ctx, info, evidence);
+        if (controller_policy.prefer(evidence, best_evidence)) {
+            best_evidence = evidence;
+            best_info = info;
+        } else {
+            state.controller_rejected_count +|= 1;
+        }
+        cleanupControllerCandidate(ctx, true);
+    }
+
+    const selected_info = best_info orelse return false;
+    const selected_evidence = best_evidence orelse return false;
+    clearControllerCandidateState();
+    state.controller_candidate_count = @intCast(candidate_count);
+    state.controller_rejected_count = @intCast(candidate_count - 1);
+    state.selected_inventory_index = selected_evidence.inventory_index;
+    if (!initializeControllerCandidate(ctx, selected_info)) {
+        cleanupControllerCandidate(ctx, true);
+        return false;
+    }
+    logSelectedController(ctx);
+    return true;
+}
+
+fn probeControllerCandidate(
+    ctx: *const r4os.r4dev.DriverContext,
+    info: r4os.abi.PciDeviceInfo,
+    inventory_index: u32,
+) controller_policy.Evidence {
+    clearControllerCandidateState();
+    state.selected_inventory_index = inventory_index;
+    _ = initializeControllerCandidate(ctx, info);
+    return collectControllerEvidence(inventory_index);
+}
+
+fn initializeControllerCandidate(ctx: *const r4os.r4dev.DriverContext, info: r4os.abi.PciDeviceInfo) bool {
+    state.stage = .pci;
+    state.info = info;
+    logDevice(ctx, info);
+    if (ctx.pciEnableBusMaster(info, r4os.abi.pci_enable_memory_space) != 0) {
+        failStage(.pci);
+        return false;
+    }
+
+    state.stage = .mmio;
+    if (ctx.pciMapBar(info, 0, 4096, 0, &state.mmio) != 0 or state.mmio.virt_addr == 0) {
+        failStage(.mmio);
+        return false;
+    }
+    readGlobalRegisters();
+    logMmio(ctx);
+
+    state.stage = .reset;
+    state.reset_requested = true;
+    if (!resetController(ctx)) {
+        failStage(.reset);
+        return false;
+    }
+    state.reset_done = true;
+
+    state.stage = .transport;
+    if (!setupCommandTransport(ctx)) {
+        failStage(.transport);
+        return false;
+    }
+
+    state.stage = .codec;
+    if (!discoverCodecs(ctx)) {
+        failStage(.codec);
+        return false;
+    }
+    chooseOutputCandidate(ctx);
+    if (!state.output.found) {
+        failStage(.output);
+        return false;
+    }
+    return true;
+}
+
+fn collectControllerEvidence(inventory_index: u32) controller_policy.Evidence {
+    var outputs: u16 = 0;
+    var analog: u16 = 0;
+    var digital: u16 = 0;
+    var address: usize = 0;
+    while (address < state.codecs.len) : (address += 1) {
+        const info = &state.codecs[address];
+        if (!info.present) continue;
+        outputs +|= info.output_count;
+        analog +|= info.analog_output_pin_count;
+        digital +|= info.digital_output_pin_count;
+    }
+    return .{
+        .inventory_index = inventory_index,
+        .transport_ready = state.transport_ready,
+        .discovery_complete = state.codec_ready and state.discovered_codec_count == state.codec_count,
+        .codec_count = state.discovered_codec_count,
+        .output_converters = outputs,
+        .analog_output_pins = analog,
+        .digital_output_pins = digital,
+    };
+}
+
+fn cleanupControllerCandidate(ctx: *const r4os.r4dev.DriverContext, restore_command: bool) void {
+    if (state.mmio.virt_addr != 0) write32(mmioBase() + REG_INTCTL, 0);
+    shutdownCommandTransport(ctx);
+    if (restore_command and state.info.vendor_id != 0) {
+        // Writing zeroes to the W1C status half avoids echoing a PCI status
+        // snapshot while restoring only the original Command word.
+        _ = ctx.pciWriteConfig32(state.info, 0x04, @as(u32, state.info.command));
+    }
+}
+
+fn clearControllerCandidateState() void {
+    state.info = .{};
+    state.mmio = .{};
+    state.stage = .none;
+    state.failed_stage = .none;
+    state.gcap = 0;
+    state.version_major = 0;
+    state.version_minor = 0;
+    state.out_payload = 0;
+    state.in_payload = 0;
+    state.gctl = 0;
+    state.intctl = 0;
+    state.intsts = 0;
+    state.statests = 0;
+    state.output_stream_count = 0;
+    state.input_stream_count = 0;
+    state.bidi_stream_count = 0;
+    state.serial_data_out_count = 0;
+    state.dma_64bit_supported = false;
+    state.codec_mask = 0;
+    state.codec_count = 0;
+    state.discovered_codec_count = 0;
+    state.command_count = 0;
+    state.response_count = 0;
+    state.unsolicited_response_count = 0;
+    state.mismatched_response_count = 0;
+    state.timeout_count = 0;
+    state.reset_requested = false;
+    state.reset_done = false;
+    state.transport_ready = false;
+    state.transport_mode = .none;
+    state.transport_fallback_count = 0;
+    state.transport_error_count = 0;
+    state.corb = .{};
+    state.rirb = .{};
+    state.corb_entries = 0;
+    state.rirb_entries = 0;
+    state.corb_write_pointer = 0;
+    state.rirb_read_pointer = 0;
+    state.codec_ready = false;
+    state.output = .{};
+    clearCodecInfo();
+    clearOutputPath();
 }
 
 fn readGlobalRegisters() void {
@@ -445,45 +648,217 @@ fn resetController(ctx: *const r4os.r4dev.DriverContext) bool {
     const base = mmioBase();
     ctx.logInfo("HDA.R4D reset controller");
     write32(base + REG_INTCTL, 0);
+    write8(base + REG_RIRBCTL, 0);
+    write8(base + REG_CORBCTL, 0);
+    if (!wait8ClearTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_DMA_STOP_TIMEOUT_MS) or
+        !wait8ClearTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_DMA_STOP_TIMEOUT_MS))
+    {
+        state.timeout_count +%= 1;
+        return false;
+    }
     write32(base + REG_GCTL, read32(base + REG_GCTL) & ~GCTL_CRST);
-    if (!wait32Clear(base + REG_GCTL, GCTL_CRST, RESET_GUARD)) return false;
+    if (!wait32ClearTimed(ctx, base + REG_GCTL, GCTL_CRST, RESET_TIMEOUT_MS)) {
+        state.timeout_count +%= 1;
+        return false;
+    }
+    // HDA 1.0a requires CRST low for at least 100 microseconds.  One R4OS
+    // timer tick is a conservative host-independent lower bound.
+    ctx.waitTicks(1);
     write32(base + REG_GCTL, read32(base + REG_GCTL) | GCTL_CRST);
-    if (!wait32Set(base + REG_GCTL, GCTL_CRST, RESET_GUARD)) return false;
+    if (!wait32SetTimed(ctx, base + REG_GCTL, GCTL_CRST, RESET_TIMEOUT_MS)) {
+        state.timeout_count +%= 1;
+        return false;
+    }
     write32(base + REG_INTCTL, 0);
+
+    const start = ctx.tickCount();
+    const span = msTicks(ctx, CODEC_WAKE_TIMEOUT_MS);
+    var codec_mask: u16 = 0;
+    while (true) {
+        codec_mask = read16(base + REG_STATESTS) & 0x7FFF;
+        if (codec_mask != 0) break;
+        if (controller_reset.expired(start, ctx.tickCount(), span)) break;
+        ctx.waitTicks(1);
+    }
+    state.gctl = read32(base + REG_GCTL);
+    state.statests = codec_mask;
+    state.codec_mask = codec_mask;
+    state.codec_count = countBits16(codec_mask);
+    if (codec_mask == 0) {
+        state.timeout_count +%= 1;
+        ctx.logError("HDA.R4D STATESTS codec wake timeout");
+        return false;
+    }
+    write16(base + REG_STATESTS, codec_mask);
     return true;
 }
 
-fn setupImmediateTransport(ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupCommandTransport(ctx: *const r4os.r4dev.DriverContext) bool {
     if (state.codec_mask == 0) {
         ctx.logWarn("HDA.R4D no codecs in STATESTS");
         return false;
     }
     const codec = firstCodecAddress() orelse return false;
-    const response = sendImmediateVerb(makeVerb(codec, 0, 0xF00, PARAM_VENDOR_ID)) orelse return false;
-    state.transport_ready = true;
-    logTransport(ctx, codec, response);
+    var corb_ready = false;
+    if (!optionDisabled(ctx, "corb")) {
+        if (setupCorbRirb(ctx)) {
+            if (sendCorbVerb(makeVerb(codec, 0, 0xF00, PARAM_VENDOR_ID))) |response| {
+                state.transport_ready = true;
+                corb_ready = true;
+                logTransport(ctx, codec, response);
+                return true;
+            }
+            state.transport_error_count +%= 1;
+        }
+        shutdownCommandTransport(ctx);
+    }
+
+    const immediate_enabled = optionEnabled(ctx, "immediate");
+    if (!command_ring.useImmediateFallback(corb_ready, immediate_enabled)) {
+        ctx.logError("HDA.R4D CORB/RIRB unavailable; Immediate fallback not enabled");
+        return false;
+    }
+    state.transport_fallback_count +%= 1;
+    ctx.logWarn("HDA.R4D using explicitly enabled Immediate fallback");
+    if (setupImmediateTransport(ctx, codec)) |response| {
+        state.transport_ready = true;
+        logTransport(ctx, codec, response);
+        return true;
+    }
+    state.transport_error_count +%= 1;
+    return false;
+}
+
+fn setupCorbRirb(ctx: *const r4os.r4dev.DriverContext) bool {
+    const base = mmioBase();
+    write8(base + REG_RIRBCTL, 0);
+    write8(base + REG_CORBCTL, 0);
+    if (!wait8ClearTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_DMA_STOP_TIMEOUT_MS) or
+        !wait8ClearTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_DMA_STOP_TIMEOUT_MS))
+    {
+        state.timeout_count +%= 1;
+        return false;
+    }
+
+    const corb_size = command_ring.chooseSize(read8(base + REG_CORBSIZE)) orelse return false;
+    const rirb_size = command_ring.chooseSize(read8(base + REG_RIRBSIZE)) orelse return false;
+    write8(base + REG_CORBSIZE, corb_size.selector);
+    write8(base + REG_RIRBSIZE, rirb_size.selector);
+    if ((read8(base + REG_CORBSIZE) & 0x03) != corb_size.selector or
+        (read8(base + REG_RIRBSIZE) & 0x03) != rirb_size.selector)
+    {
+        return false;
+    }
+
+    const max_phys_addr: u64 = if (state.dma_64bit_supported) ~@as(u64, 0) else 0xFFFF_FFFF;
+    const corb_bytes: u32 = @intCast(@as(usize, corb_size.entries) * @sizeOf(u32));
+    const rirb_bytes: u32 = @intCast(@as(usize, rirb_size.entries) * @sizeOf(RirbEntry));
+    if (ctx.allocDmaRegionConstrained(corb_bytes, 128, max_phys_addr, &state.corb) != 0 or
+        state.corb.phys_addr == 0 or state.corb.virt_addr == 0)
+    {
+        return false;
+    }
+    if (ctx.allocDmaRegionConstrained(rirb_bytes, 128, max_phys_addr, &state.rirb) != 0 or
+        state.rirb.phys_addr == 0 or state.rirb.virt_addr == 0)
+    {
+        ctx.freeDmaRegion(&state.corb);
+        return false;
+    }
+    state.corb_entries = corb_size.entries;
+    state.rirb_entries = rirb_size.entries;
+    state.corb_write_pointer = 0;
+    state.rirb_read_pointer = 0;
+
+    const corb_memory: [*]u8 = @ptrFromInt(state.corb.virt_addr);
+    const rirb_memory: [*]u8 = @ptrFromInt(state.rirb.virt_addr);
+    @memset(corb_memory[0..corb_bytes], 0);
+    @memset(rirb_memory[0..rirb_bytes], 0);
+    write32(base + REG_CORBLBASE, @truncate(state.corb.phys_addr));
+    write32(base + REG_CORBUBASE, @truncate(state.corb.phys_addr >> 32));
+    write32(base + REG_RIRBLBASE, @truncate(state.rirb.phys_addr));
+    write32(base + REG_RIRBUBASE, @truncate(state.rirb.phys_addr >> 32));
+
+    write16(base + REG_CORBWP, 0);
+    write16(base + REG_CORBRP, CORBRP_RESET);
+    if ((read16(base + REG_CORBRP) & CORBRP_RESET) != 0) write16(base + REG_CORBRP, 0);
+    if (!wait16ClearTimed(ctx, base + REG_CORBRP, CORBRP_RESET, COMMAND_TIMEOUT_MS)) {
+        state.timeout_count +%= 1;
+        return false;
+    }
+    write16(base + REG_RIRBWP, RIRBWP_RESET);
+    if (!wait16ValueTimed(ctx, base + REG_RIRBWP, 0x00FF, 0, COMMAND_TIMEOUT_MS)) {
+        state.timeout_count +%= 1;
+        return false;
+    }
+    write16(base + REG_RINTCNT, 1);
+    write8(base + REG_CORBSTS, CORBSTS_MEMORY_ERROR);
+    write8(base + REG_RIRBSTS, RIRBSTS_CLEAR);
+    dmaBarrier();
+    // RINTCNT=1 requires a response status transition for each command.  GIE
+    // remains clear during discovery, so enabling the RIRB response cause
+    // creates a pollable W1C handshake without dispatching an IRQ.
+    write8(base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE | RIRBCTL_RESPONSE_ENABLE);
+    write8(base + REG_CORBCTL, CORBCTL_RUN);
+    if (!wait8SetTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_TIMEOUT_MS) or
+        !wait8SetTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_TIMEOUT_MS))
+    {
+        state.timeout_count +%= 1;
+        return false;
+    }
+    state.transport_mode = .corb_rirb;
     return true;
+}
+
+fn setupImmediateTransport(ctx: *const r4os.r4dev.DriverContext, codec: u8) ?u32 {
+    state.transport_mode = .immediate;
+    return sendImmediateVerb(ctx, makeVerb(codec, 0, 0xF00, PARAM_VENDOR_ID));
+}
+
+fn shutdownCommandTransport(ctx: *const r4os.r4dev.DriverContext) void {
+    if (state.mmio.virt_addr != 0) {
+        const base = mmioBase();
+        write8(base + REG_RIRBCTL, 0);
+        write8(base + REG_CORBCTL, 0);
+        if (!wait8ClearTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_DMA_STOP_TIMEOUT_MS) or
+            !wait8ClearTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_DMA_STOP_TIMEOUT_MS))
+        {
+            state.timeout_count +%= 1;
+        }
+        write8(base + REG_CORBSTS, CORBSTS_MEMORY_ERROR);
+        write8(base + REG_RIRBSTS, RIRBSTS_CLEAR);
+    }
+    if (state.rirb.phys_addr != 0) ctx.freeDmaRegion(&state.rirb);
+    if (state.corb.phys_addr != 0) ctx.freeDmaRegion(&state.corb);
+    state.rirb = .{};
+    state.corb = .{};
+    state.corb_entries = 0;
+    state.rirb_entries = 0;
+    state.corb_write_pointer = 0;
+    state.rirb_read_pointer = 0;
+    state.transport_mode = .none;
+    state.transport_ready = false;
 }
 
 fn discoverCodecs(ctx: *const r4os.r4dev.DriverContext) bool {
     clearCodecInfo();
-    var ok = false;
+    var complete = true;
+    var any = false;
     var addr: u8 = 0;
     while (addr < 15) : (addr += 1) {
         if ((state.codec_mask & (@as(u16, 1) << @intCast(addr))) == 0) continue;
-        if (state.discovered_codec_count >= MAX_CODECS) break;
-
-        const index = state.discovered_codec_count;
-        if (discoverCodec(ctx, addr, index)) {
-            state.discovered_codec_count += 1;
-            ok = true;
+        if (discoverCodec(ctx, addr)) {
+            state.discovered_codec_count +%= 1;
+            any = true;
+        } else {
+            complete = false;
+            state.last_error = "codec discovery incomplete";
         }
     }
-    state.codec_ready = ok;
-    return ok;
+    state.codec_ready = any and complete and state.discovered_codec_count == state.codec_count;
+    return state.codec_ready;
 }
 
-fn discoverCodec(ctx: *const r4os.r4dev.DriverContext, addr: u8, index: u8) bool {
+fn discoverCodec(ctx: *const r4os.r4dev.DriverContext, addr: u8) bool {
     var info = CodecInfo{};
     info.present = true;
     info.address = addr;
@@ -492,42 +867,53 @@ fn discoverCodec(ctx: *const r4os.r4dev.DriverContext, addr: u8, index: u8) bool
     const root_nodes = getParameter(addr, 0, PARAM_SUB_NODE_COUNT) orelse return false;
     info.root_start = subNodeStart(root_nodes);
     info.root_count = subNodeCount(root_nodes);
+    if (!nodeRangeValid(info.root_start, info.root_count)) return false;
 
-    var node_offset: u8 = 0;
+    var node_offset: u16 = 0;
     while (node_offset < info.root_count) : (node_offset += 1) {
-        const fg_node = info.root_start + node_offset;
-        const fg_type_raw = getParameter(addr, fg_node, PARAM_FUNCTION_GROUP_TYPE) orelse continue;
+        const fg_node: u8 = @intCast(@as(u16, info.root_start) + node_offset);
+        const fg_type_raw = getParameter(addr, fg_node, PARAM_FUNCTION_GROUP_TYPE) orelse return false;
         const fg_type: u8 = @truncate(fg_type_raw & 0xFF);
         if ((fg_type & 0x7F) != FUNCTION_GROUP_AUDIO) continue;
 
-        info.afg_node = fg_node;
+        if (!codec_inventory.appendAudioFunctionGroup(&info.afg_nodes, &info.afg_count, fg_node)) return false;
+        if (info.afg_node == 0) info.afg_node = fg_node;
         const widget_nodes = getParameter(addr, fg_node, PARAM_SUB_NODE_COUNT) orelse return false;
-        info.afg_widgets_start = subNodeStart(widget_nodes);
-        info.afg_widgets_count = subNodeCount(widget_nodes);
-        discoverWidgets(addr, &info);
-        break;
+        if (!discoverWidgets(addr, fg_node, widget_nodes, &info)) return false;
     }
 
-    state.codecs[@intCast(index)] = info;
-    logCodecInfo(ctx, &state.codecs[@intCast(index)]);
+    state.codecs[@intCast(addr)] = info;
+    logCodecInfo(ctx, &state.codecs[@intCast(addr)]);
     return true;
 }
 
-fn discoverWidgets(addr: u8, info: *CodecInfo) void {
-    var offset: u8 = 0;
-    while (offset < info.afg_widgets_count and info.discovered_widgets < MAX_WIDGETS) : (offset += 1) {
-        const node = info.afg_widgets_start + offset;
-        const caps = getParameter(addr, node, PARAM_AUDIO_WIDGET_CAPS) orelse continue;
+fn discoverWidgets(addr: u8, afg_node: u8, nodes: u32, info: *CodecInfo) bool {
+    const start = subNodeStart(nodes);
+    const count = subNodeCount(nodes);
+    if (!nodeRangeValid(start, count)) return false;
+    var offset: u16 = 0;
+    while (offset < count) : (offset += 1) {
+        const node: u8 = @intCast(@as(u16, start) + offset);
+        const index: usize = node;
+        if (info.widgets[index].present) return false;
+        const caps = getParameter(addr, node, PARAM_AUDIO_WIDGET_CAPS) orelse return false;
         const kind: u8 = @truncate((caps >> 20) & 0x0F);
-        if (!isRelevantWidget(kind)) continue;
-
-        const out_index: usize = info.discovered_widgets;
-        info.widgets[out_index].node = node;
-        info.widgets[out_index].kind = kind;
-        info.widgets[out_index].caps = caps;
+        info.widgets[index] = .{
+            .present = true,
+            .node = node,
+            .afg_node = afg_node,
+            .kind = kind,
+            .caps = caps,
+        };
         if (kind == WIDGET_PIN_COMPLEX) {
-            info.widgets[out_index].pin_caps = getParameter(addr, node, PARAM_PIN_CAPS) orelse 0;
+            info.widgets[index].pin_caps = getParameter(addr, node, PARAM_PIN_CAPS) orelse return false;
+            info.widgets[index].pin_config = getPinConfig(addr, node) orelse return false;
             info.pin_count += 1;
+            if ((info.widgets[index].pin_caps & PIN_CAP_OUTPUT) != 0 and pinIsConnected(info.widgets[index].pin_config)) {
+                const device = pinDefaultDevice(info.widgets[index].pin_config);
+                if (isAnalogOutputDevice(device)) info.analog_output_pin_count += 1;
+                if (isDigitalOutputDevice(device)) info.digital_output_pin_count += 1;
+            }
         } else if (kind == WIDGET_AUDIO_OUTPUT) {
             info.output_count += 1;
         } else if (kind == WIDGET_AUDIO_MIXER) {
@@ -537,56 +923,49 @@ fn discoverWidgets(addr: u8, info: *CodecInfo) void {
         }
         info.discovered_widgets += 1;
     }
+    return true;
 }
 
 fn chooseOutputCandidate(ctx: *const r4os.r4dev.DriverContext) void {
     state.output = .{};
+    var best_rank: u8 = 0;
     var codec_index: usize = 0;
-    while (codec_index < state.discovered_codec_count and codec_index < MAX_CODECS) : (codec_index += 1) {
+    while (codec_index < state.codecs.len) : (codec_index += 1) {
         const info = &state.codecs[codec_index];
-        if (!info.present or info.afg_node == 0) continue;
-
-        var converter: u8 = 0;
-        var pin: u8 = 0;
-        var widget_index: usize = 0;
-        while (widget_index < info.discovered_widgets and widget_index < MAX_WIDGETS) : (widget_index += 1) {
-            const widget = info.widgets[widget_index];
-            if (converter == 0 and widget.kind == WIDGET_AUDIO_OUTPUT) converter = widget.node;
-            if (pin == 0 and widget.kind == WIDGET_PIN_COMPLEX and (widget.pin_caps & PIN_CAP_OUTPUT) != 0) pin = widget.node;
-        }
-
-        if (converter != 0 and pin != 0) {
+        if (!info.present) continue;
+        var pin_index: usize = 0;
+        while (pin_index < info.widgets.len) : (pin_index += 1) {
+            const pin = info.widgets[pin_index];
+            if (!pin.present or pin.kind != WIDGET_PIN_COMPLEX or (pin.pin_caps & PIN_CAP_OUTPUT) == 0) continue;
+            if (!pinIsConnected(pin.pin_config)) continue;
+            const rank = analogPinRank(pin.pin_config);
+            if (rank == 0 or rank < best_rank) continue;
+            const converter = firstOutputConverterForAfg(info, pin.afg_node) orelse continue;
+            if (rank == best_rank and state.output.found) continue;
+            best_rank = rank;
             state.output = .{
                 .found = true,
                 .codec = info.address,
-                .afg = info.afg_node,
+                .afg = pin.afg_node,
                 .converter = converter,
                 .converter_caps = widgetCaps(info, converter),
-                .pin = pin,
-                .pin_widget_caps = widgetCaps(info, pin),
-                .pin_caps = pinCaps(info, pin),
+                .pin = pin.node,
+                .pin_widget_caps = pin.caps,
+                .pin_caps = pin.pin_caps,
+                .pin_config = pin.pin_config,
             };
-            logOutputCandidate(ctx);
-            return;
         }
     }
-    ctx.logWarn("HDA.R4D no output candidate");
+    if (state.output.found) {
+        logOutputCandidate(ctx);
+    } else {
+        ctx.logWarn("HDA.R4D no analog output candidate");
+    }
 }
 
 fn widgetCaps(info: *const CodecInfo, node: u8) u32 {
-    var i: usize = 0;
-    while (i < info.discovered_widgets and i < MAX_WIDGETS) : (i += 1) {
-        if (info.widgets[i].node == node) return info.widgets[i].caps;
-    }
-    return 0;
-}
-
-fn pinCaps(info: *const CodecInfo, node: u8) u32 {
-    var i: usize = 0;
-    while (i < info.discovered_widgets and i < MAX_WIDGETS) : (i += 1) {
-        if (info.widgets[i].node == node) return info.widgets[i].pin_caps;
-    }
-    return 0;
+    const widget = info.widgets[@intCast(node)];
+    return if (widget.present) widget.caps else 0;
 }
 
 fn clearOutputPath() void {
@@ -1356,6 +1735,7 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
         return false;
     }
     logPlaybackSummary(ctx);
+    shutdownCommandTransport(ctx);
     if (state.stream_desc_base != 0) {
         write32(state.stream_desc_base + SD_CTL, read32(state.stream_desc_base + SD_CTL) & ~SD_CTL_RUN);
         write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
@@ -1369,6 +1749,9 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
     if (state.stream_bdl.phys_addr != 0) {
         ctx.freeDmaRegion(&state.stream_bdl);
         state.stream_bdl = .{};
+    }
+    if (state.info.vendor_id != 0) {
+        _ = ctx.pciWriteConfig32(state.info, 0x04, @as(u32, state.info.command));
     }
     state.initialized = false;
     @atomicStore(bool, &state.present, false, .release);
@@ -1433,30 +1816,34 @@ fn noteHdaWarn(ctx: *const r4os.r4dev.DriverContext, message: [*:0]const u8) voi
 }
 
 fn getParameter(codec: u8, node: u8, parameter: u8) ?u32 {
-    return sendImmediateVerb(makeVerb(codec, node, 0xF00, parameter));
+    return sendVerb(makeVerb(codec, node, 0xF00, parameter));
+}
+
+fn getPinConfig(codec: u8, node: u8) ?u32 {
+    return sendVerb(makeVerb(codec, node, VERB_GET_CONFIG_DEFAULT, 0));
 }
 
 fn setConverterStreamChannel(codec: u8, node: u8, stream_id: u8, channel_id: u8) bool {
     const payload: u8 = ((stream_id & 0x0F) << 4) | (channel_id & 0x0F);
-    return sendImmediateVerb(makeVerb(codec, node, 0x706, payload)) != null;
+    return sendVerb(makeVerb(codec, node, 0x706, payload)) != null;
 }
 
 fn setPinControl(codec: u8, node: u8, control: u8) bool {
-    return sendImmediateVerb(makeVerb(codec, node, 0x707, control)) != null;
+    return sendVerb(makeVerb(codec, node, 0x707, control)) != null;
 }
 
 fn setConnectionSelect(codec: u8, node: u8, index: u8) bool {
-    return sendImmediateVerb(makeVerb(codec, node, 0x701, index)) != null;
+    return sendVerb(makeVerb(codec, node, 0x701, index)) != null;
 }
 
 fn setEapd(codec: u8, node: u8) bool {
-    return sendImmediateVerb(makeVerb(codec, node, 0x70C, EAPD_BTL_ENABLE)) != null;
+    return sendVerb(makeVerb(codec, node, 0x70C, EAPD_BTL_ENABLE)) != null;
 }
 
 fn unmuteOutput(codec: u8, node: u8, caps: u32) bool {
     if ((caps & WIDGET_CAP_OUT_AMP) == 0) return false;
     const payload: u16 = 0xB000 | 0x40;
-    return sendImmediateVerb(makeLongVerb(codec, node, 0x3, payload)) != null;
+    return sendVerb(makeLongVerb(codec, node, 0x3, payload)) != null;
 }
 
 fn findConnectionIndex(codec: u8, pin_node: u8, target_node: u8) ?u8 {
@@ -1468,7 +1855,7 @@ fn findConnectionIndex(codec: u8, pin_node: u8, target_node: u8) ?u8 {
     var index: u8 = 0;
     while (index < count) : (index += 1) {
         const command_index = if (long_form) index & 0xFE else index & 0xFC;
-        const entry_block = sendImmediateVerb(makeVerb(codec, pin_node, 0xF02, command_index)) orelse return null;
+        const entry_block = sendVerb(makeVerb(codec, pin_node, 0xF02, command_index)) orelse return null;
         const entry_node: u16 = if (long_form)
             @truncate((entry_block >> @as(u5, @truncate((index & 1) * 16))) & 0xFFFF)
         else
@@ -1478,16 +1865,92 @@ fn findConnectionIndex(codec: u8, pin_node: u8, target_node: u8) ?u8 {
     return null;
 }
 
-fn sendImmediateVerb(verb: u32) ?u32 {
+fn sendVerb(verb: u32) ?u32 {
+    if (state.transport_mode == .corb_rirb) return sendCorbVerb(verb);
+    if (state.transport_mode == .immediate) {
+        var ctx = context();
+        return sendImmediateVerb(&ctx, verb);
+    }
+    return null;
+}
+
+fn sendCorbVerb(verb: u32) ?u32 {
+    if (state.corb.virt_addr == 0 or state.rirb.virt_addr == 0 or
+        state.corb_entries == 0 or state.rirb_entries == 0)
+    {
+        return null;
+    }
+    var ctx = context();
     const base = mmioBase();
-    if (!wait16Clear(base + REG_ICIS, ICIS_BUSY, COMMAND_GUARD)) {
+    const codec: u8 = @truncate(verb >> 28);
+    const deadline = ctx.tickCount() +| msTicks(&ctx, COMMAND_TIMEOUT_MS);
+    var next_wp = command_ring.next(state.corb_write_pointer, state.corb_entries);
+    while (command_ring.isFull(state.corb_write_pointer, read16(base + REG_CORBRP) & 0x00FF, state.corb_entries)) {
+        if (ctx.tickCount() >= deadline) {
+            state.timeout_count +%= 1;
+            return null;
+        }
+        if ((read8(base + REG_CORBSTS) & CORBSTS_MEMORY_ERROR) != 0) {
+            state.transport_error_count +%= 1;
+            return null;
+        }
+        ctx.waitTicks(1);
+        next_wp = command_ring.next(state.corb_write_pointer, state.corb_entries);
+    }
+
+    const corb: [*]volatile u32 = @ptrFromInt(state.corb.virt_addr);
+    corb[@intCast(next_wp)] = verb;
+    dmaBarrier();
+    state.corb_write_pointer = next_wp;
+    state.command_count +%= 1;
+    write16(base + REG_CORBWP, next_wp);
+
+    while (ctx.tickCount() <= deadline) {
+        const corb_status = read8(base + REG_CORBSTS);
+        const rirb_status = read8(base + REG_RIRBSTS);
+        if ((corb_status & CORBSTS_MEMORY_ERROR) != 0 or (rirb_status & RIRBSTS_OVERRUN) != 0) {
+            if ((corb_status & CORBSTS_MEMORY_ERROR) != 0) write8(base + REG_CORBSTS, CORBSTS_MEMORY_ERROR);
+            if ((rirb_status & RIRBSTS_OVERRUN) != 0) write8(base + REG_RIRBSTS, RIRBSTS_OVERRUN);
+            state.transport_error_count +%= 1;
+            return null;
+        }
+
+        const hardware_wp = command_ring.normalize(read16(base + REG_RIRBWP) & 0x00FF, state.rirb_entries);
+        const rirb: [*]volatile RirbEntry = @ptrFromInt(state.rirb.virt_addr);
+        while (state.rirb_read_pointer != hardware_wp) {
+            state.rirb_read_pointer = command_ring.next(state.rirb_read_pointer, state.rirb_entries);
+            dmaBarrier();
+            const raw = rirb[@intCast(state.rirb_read_pointer)];
+            const response = command_ring.decodeResponse(raw.response, raw.extended);
+            if (response.unsolicited) {
+                state.unsolicited_response_count +%= 1;
+                continue;
+            }
+            if (!command_ring.isMatchingSolicited(response, codec)) {
+                state.mismatched_response_count +%= 1;
+                continue;
+            }
+            state.response_count +%= 1;
+            if ((rirb_status & RIRBSTS_RESPONSE) != 0) write8(base + REG_RIRBSTS, RIRBSTS_RESPONSE);
+            return response.value;
+        }
+        if ((rirb_status & RIRBSTS_RESPONSE) != 0) write8(base + REG_RIRBSTS, RIRBSTS_RESPONSE);
+        ctx.waitTicks(1);
+    }
+    state.timeout_count +%= 1;
+    return null;
+}
+
+fn sendImmediateVerb(ctx: *const r4os.r4dev.DriverContext, verb: u32) ?u32 {
+    const base = mmioBase();
+    if (!wait16ClearTimed(ctx, base + REG_ICIS, ICIS_BUSY, COMMAND_TIMEOUT_MS)) {
         state.timeout_count += 1;
         return null;
     }
     write16(base + REG_ICIS, ICIS_VALID);
     write32(base + REG_ICOI, verb);
     write16(base + REG_ICIS, ICIS_BUSY);
-    if (!wait16Clear(base + REG_ICIS, ICIS_BUSY, COMMAND_GUARD)) {
+    if (!wait16ClearTimed(ctx, base + REG_ICIS, ICIS_BUSY, COMMAND_TIMEOUT_MS)) {
         state.timeout_count += 1;
         return null;
     }
@@ -1543,11 +2006,44 @@ fn subNodeCount(value: u32) u8 {
     return @truncate(value & 0xFF);
 }
 
-fn isRelevantWidget(kind: u8) bool {
-    return kind == WIDGET_AUDIO_OUTPUT or
-        kind == WIDGET_PIN_COMPLEX or
-        kind == WIDGET_AUDIO_MIXER or
-        kind == WIDGET_AUDIO_SELECTOR;
+fn nodeRangeValid(start: u8, count: u8) bool {
+    return codec_inventory.decodeNodeRange((@as(u32, start) << 16) | count) != null;
+}
+
+fn pinDefaultDevice(config: u32) u8 {
+    return @truncate((config >> PIN_DEFAULT_DEVICE_SHIFT) & PIN_DEFAULT_DEVICE_MASK);
+}
+
+fn pinIsConnected(config: u32) bool {
+    const connectivity: u8 = @truncate((config >> PIN_DEFAULT_CONNECTIVITY_SHIFT) & PIN_DEFAULT_CONNECTIVITY_MASK);
+    return connectivity != PIN_CONNECTIVITY_NONE;
+}
+
+fn isAnalogOutputDevice(device: u8) bool {
+    return device == PIN_DEVICE_LINE_OUT or device == PIN_DEVICE_SPEAKER or device == PIN_DEVICE_HEADPHONE;
+}
+
+fn isDigitalOutputDevice(device: u8) bool {
+    return device == PIN_DEVICE_SPDIF_OUT or device == PIN_DEVICE_DIGITAL_OTHER_OUT;
+}
+
+fn analogPinRank(config: u32) u8 {
+    if (!pinIsConnected(config)) return 0;
+    return switch (pinDefaultDevice(config)) {
+        PIN_DEVICE_SPEAKER => 3,
+        PIN_DEVICE_HEADPHONE => 2,
+        PIN_DEVICE_LINE_OUT => 1,
+        else => 0,
+    };
+}
+
+fn firstOutputConverterForAfg(info: *const CodecInfo, afg_node: u8) ?u8 {
+    var index: usize = 0;
+    while (index < info.widgets.len) : (index += 1) {
+        const widget = info.widgets[index];
+        if (widget.present and widget.afg_node == afg_node and widget.kind == WIDGET_AUDIO_OUTPUT) return widget.node;
+    }
+    return null;
 }
 
 fn countBits16(value: u16) u8 {
@@ -1580,6 +2076,19 @@ fn zEq(z: [*:0]const u8, text: []const u8) bool {
 fn failStage(stage: InitStage) void {
     state.stage = .failed;
     state.failed_stage = stage;
+}
+
+fn initFailureCode(stage: InitStage) i32 {
+    return switch (stage) {
+        .pci => -11,
+        .mmio => -12,
+        .reset => -13,
+        .transport => -14,
+        .codec => -15,
+        .output => -16,
+        .dma => -17,
+        else => -19,
+    };
 }
 
 fn context() r4os.r4dev.DriverContext {
@@ -1616,10 +2125,62 @@ fn write32(addr: u64, value: u32) void {
     ptr.* = value;
 }
 
-fn wait16Clear(addr: u64, mask: u16, limit: u32) bool {
-    var guard: u32 = 0;
-    while ((read16(addr) & mask) != 0 and guard < limit) : (guard += 1) {}
-    return (read16(addr) & mask) == 0;
+fn dmaBarrier() void {
+    asm volatile ("mfence" ::: .{ .memory = true });
+}
+
+fn wait8ClearTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u8, timeout_ms: u64) bool {
+    const start = ctx.tickCount();
+    const span = msTicks(ctx, timeout_ms);
+    while ((read8(addr) & mask) != 0) {
+        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
+}
+
+fn wait8SetTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u8, timeout_ms: u64) bool {
+    const start = ctx.tickCount();
+    const span = msTicks(ctx, timeout_ms);
+    while ((read8(addr) & mask) == 0) {
+        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
+}
+
+fn wait16ClearTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u16, timeout_ms: u64) bool {
+    return wait16ValueTimed(ctx, addr, mask, 0, timeout_ms);
+}
+
+fn wait16ValueTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u16, value: u16, timeout_ms: u64) bool {
+    const start = ctx.tickCount();
+    const span = msTicks(ctx, timeout_ms);
+    while ((read16(addr) & mask) != value) {
+        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
+}
+
+fn wait32SetTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u32, timeout_ms: u64) bool {
+    const start = ctx.tickCount();
+    const span = msTicks(ctx, timeout_ms);
+    while ((read32(addr) & mask) == 0) {
+        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
+}
+
+fn wait32ClearTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u32, timeout_ms: u64) bool {
+    const start = ctx.tickCount();
+    const span = msTicks(ctx, timeout_ms);
+    while ((read32(addr) & mask) != 0) {
+        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
 }
 
 fn wait32Set(addr: u64, mask: u32, limit: u32) bool {
@@ -1677,12 +2238,54 @@ fn logMmio(ctx: *const r4os.r4dev.DriverContext) void {
 }
 
 fn logTransport(ctx: *const r4os.r4dev.DriverContext, codec: u8, vendor_id: u32) void {
-    var line: [96:0]u8 = undefined;
+    var line: [128:0]u8 = undefined;
     var len: usize = 0;
-    appendText(&line, &len, "HDA.R4D transport immediate codec=");
+    appendText(&line, &len, "HDA.R4D transport ");
+    appendText(&line, &len, if (state.transport_mode == .corb_rirb) "corb-rirb" else if (state.transport_mode == .immediate) "immediate-fallback" else "none");
+    appendText(&line, &len, " codec=");
     appendDec(&line, &len, codec);
     appendText(&line, &len, " vendor=0x");
     appendHex(&line, &len, vendor_id, 8);
+    logLine(ctx, &line, len);
+}
+
+fn logControllerCandidate(
+    ctx: *const r4os.r4dev.DriverContext,
+    info: r4os.abi.PciDeviceInfo,
+    evidence: controller_policy.Evidence,
+) void {
+    var line: [192:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.R4D controller candidate index=");
+    appendDec(&line, &len, evidence.inventory_index);
+    appendText(&line, &len, " pci=");
+    appendDec(&line, &len, info.bus);
+    appendText(&line, &len, ":");
+    appendDec(&line, &len, info.device);
+    appendText(&line, &len, ".");
+    appendDec(&line, &len, info.function);
+    appendText(&line, &len, " transport=");
+    appendText(&line, &len, if (evidence.transport_ready) "yes" else "no");
+    appendText(&line, &len, " complete=");
+    appendText(&line, &len, if (evidence.discovery_complete) "yes" else "no");
+    appendText(&line, &len, " codecs=");
+    appendDec(&line, &len, evidence.codec_count);
+    appendText(&line, &len, " analog=");
+    appendDec(&line, &len, evidence.analog_output_pins);
+    appendText(&line, &len, " digital=");
+    appendDec(&line, &len, evidence.digital_output_pins);
+    logLine(ctx, &line, len);
+}
+
+fn logSelectedController(ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [128:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.R4D selected controller index=");
+    appendDec(&line, &len, state.selected_inventory_index);
+    appendText(&line, &len, " candidates=");
+    appendDec(&line, &len, state.controller_candidate_count);
+    appendText(&line, &len, " rejected=");
+    appendDec(&line, &len, state.controller_rejected_count);
     logLine(ctx, &line, len);
 }
 
@@ -1816,8 +2419,10 @@ fn logPlaybackReady(ctx: *const r4os.r4dev.DriverContext) void {
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D playback backend ready codecs=");
     appendDec(&line, &len, state.discovered_codec_count);
-    appendText(&line, &len, " transport=immediate reset=");
-    appendText(&line, &len, if (state.reset_done) "done" else "passive");
+    appendText(&line, &len, " transport=");
+    appendText(&line, &len, if (state.transport_mode == .corb_rirb) "corb-rirb" else if (state.transport_mode == .immediate) "immediate-fallback" else "none");
+    appendText(&line, &len, " reset=");
+    appendText(&line, &len, if (state.reset_done) "done" else "missing");
     appendText(&line, &len, " commands=");
     appendDec(&line, &len, state.command_count);
     appendText(&line, &len, " backend=");

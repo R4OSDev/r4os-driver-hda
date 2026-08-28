@@ -1,10 +1,48 @@
-﻿HDA.R4D 0.3.7
+﻿HDA.R4D 0.3.8
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
 Das Modul wird als R4D ueber R4DEV geladen und stellt den aktiven PCM-Backend-
 Vertrag fuer AUDSVC bereit. Der Kernel enthaelt nur gemeinsame PCI-, IRQ-,
 DMA-, Driver-Work- und Audio-Registrierungsmechanismen.
+
+Controller, Reset und Codecinventar
+-----------------------------------
+Der Treiber enumeriert alle begrenzt im kanonischen PCI-Inventar vorhandenen
+Funktionen der Klasse 04/03. Jeder Kandidat wird kontrolliert gequiesced,
+unabhaengig von einem Firmwarealtzustand ueber CRST zurueckgesetzt und erst
+nach dem zeitlich begrenzten STATESTS-Fenster untersucht. Reine HDMI-/Digital-
+Kandidaten verdraengen keinen spaeteren Controller mit analogem Speaker-,
+Kopfhoerer- oder Line-Out-Pin. Bei gleicher analoger Evidenz entscheidet die
+kanonische PCI-Inventarreihenfolge. Abgelehnte Kandidaten stoppen ihren
+Kommandotransport, geben CORB/RIRB-DMA frei und erhalten ihr urspruengliches
+PCI-Command-Wort zurueck; der ausgewaehlte Kandidat wird definiert neu
+initialisiert. Kandidat, Auswahl und Ablehnungszahl bleiben im Treiberlog
+sichtbar.
+
+STATESTS wird fuer alle 15 gueltigen Codecadressen ausgewertet. Jeder
+gemeldete Codec muss vollstaendig antworten. Alle Audio Function Groups und
+alle gueltigen acht Bit breiten Nodebereiche bis zum exklusiven Ende 256
+werden inventarisiert. Ueberlauf, ueberlappende Widgets oder eine fehlende
+Antwort machen die Discovery sichtbar unvollstaendig; es gibt keine stillen
+MAX_CODECS-/MAX_WIDGETS-Kappungen mehr.
+
+Kommandotransport
+-----------------
+CORB/RIRB ist der regulaere Verbtransport. Der Treiber handelt die groesste
+vom jeweiligen Register gemeldete Ringgroesse 2, 16 oder 256 aus, allokiert
+128-Byte-ausgerichtete und bei fehlender 64-Bit-Faehigkeit unter 4 GiB
+begrenzte DMA-Ringe, setzt Zeiger und Runbits definiert und ordnet jede
+solicited Antwort ueber die erweiterte Codecadresse zu. Unsolicited oder an
+einen anderen Codec adressierte Eintraege werden nicht als Antwort des
+laufenden Kommandos akzeptiert. Reset, Stop, Ringvollstand und Antwort besitzen
+monotone Zeitfristen; Speicherfehler und RIRB-Overrun brechen sichtbar ab.
+
+Immediate Command ist kein automatischer Ersatz. Nur
+`OPTION HDA immediate=on` erlaubt nach einem fehlgeschlagenen CORB/RIRB-Pfad
+den begrenzten, als `immediate-fallback` protokollierten Diagnoseweg. Mit
+`OPTION HDA corb=off` kann dieser Weg ausdruecklich erzwungen werden. Ohne
+Opt-in scheitert die Initialisierung statt den Transport still zu wechseln.
 
 Format und Puffer
 -----------------
@@ -96,8 +134,11 @@ Build und Tests
     ./Build.sh test
 
 Der Schritt baut und inspiziert HDA.R4D und prueft ByteQueue, Wraparound,
-Startreserve, Periodenbesitz, Lueckenerkennung, Recovery und den
-IRQ-Generation-Gate mit genau einem Durchlauf und neuem Successor. Die
+Startreserve, Periodenbesitz, Lueckenerkennung, Recovery, den
+IRQ-Generation-Gate mit genau einem Durchlauf und neuem Successor sowie
+Mehrcontrollerauswahl, Reset-/Timeoutzustaende, CORB/RIRB-Groessen und
+-Antworten, expliziten Immediate-Fallback, alle Codecadressen, mehrere AFGs
+und die vollstaendige Nodegrenze. Die
 End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.

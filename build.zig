@@ -27,8 +27,44 @@ pub fn build(b: *std.Build) void {
     const work_gate_tests = b.addTest(.{ .root_module = work_gate_tests_module });
     const run_work_gate_tests = b.addRunArtifact(work_gate_tests);
 
+    const controller_policy_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/controller_policy.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const controller_policy_tests = b.addTest(.{ .root_module = controller_policy_tests_module });
+    const run_controller_policy_tests = b.addRunArtifact(controller_policy_tests);
+
+    const controller_reset_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/controller_reset.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const controller_reset_tests = b.addTest(.{ .root_module = controller_reset_tests_module });
+    const run_controller_reset_tests = b.addRunArtifact(controller_reset_tests);
+
+    const command_ring_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/command_ring.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const command_ring_tests = b.addTest(.{ .root_module = command_ring_tests_module });
+    const run_command_ring_tests = b.addRunArtifact(command_ring_tests);
+
+    const codec_inventory_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/codec_inventory.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const codec_inventory_tests = b.addTest(.{ .root_module = codec_inventory_tests_module });
+    const run_codec_inventory_tests = b.addRunArtifact(codec_inventory_tests);
+
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ring_tests.step);
     test_step.dependOn(&run_work_gate_tests.step);
+    test_step.dependOn(&run_controller_policy_tests.step);
+    test_step.dependOn(&run_controller_reset_tests.step);
+    test_step.dependOn(&run_command_ring_tests.step);
+    test_step.dependOn(&run_codec_inventory_tests.step);
 }
