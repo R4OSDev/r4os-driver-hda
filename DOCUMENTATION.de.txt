@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.9
+﻿HDA.R4D 0.3.10
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -86,9 +86,9 @@ beim Start Pin Sense. Falls Trigger Required gesetzt ist, wird die Messung
 vorher ausgeloest. Der ohnehin vorhandene Backend-Status-/Schreibpfad prueft
 danach hoechstens alle 250 ms und wechselt unter dem Stream-Lock zwischen dem
 bewiesenen Headphone- und dem festen Speaker-/Line-Out-Pfad. Unsolicited
-Responses werden in dieser Unterversion nicht aktiviert; ihre IRQ-Haertung
-gehoert zu 0.71.8. Fehlt belastbare Jack-Evidenz, bleibt der feste Fallback
-sichtbar protokolliert.
+Responses bleiben deaktiviert; eine spaetere Aktivierung muesste denselben
+gehaerteten IRQ-/Workerpfad verwenden. Fehlt belastbare Jack-Evidenz, bleibt
+der feste Fallback sichtbar protokolliert.
 
 Format und Puffer
 -----------------
@@ -99,6 +99,13 @@ DMA-Allokation den zyklischen Ring; die vorgeschaltete ByteQueue fasst
 ebenfalls 64 Zeitraeume.
 Wenn GCAP keine 64-Bit-Adressierung meldet, fordert der Treiber BDL und Ring
 explizit unterhalb von 4 GiB an; physische Adressen werden nie abgeschnitten.
+
+Die Summe aus Input-, Output- und bidirektionalen GCAP-Descriptoren wird auf
+den darstellbaren Controllerbereich begrenzt. Ein eigener Output-Descriptor
+hat Vorrang. Fehlt er, darf ein bidirektionaler Descriptor nur mit gesetztem
+Output-Richtungsbit verwendet werden. Vor jeder DMA-Allokation muessen die
+bewiesene Analogroute und die Converter-/PCM-/Streamfaehigkeiten gemeinsam
+das feste Format tragen; sonst scheitert die Streaminitialisierung sichtbar.
 
 writePcm akzeptiert gueltige frame-ausgerichtete Paketgroessen bis zur
 32-Perioden-Sollreserve und meldet danach nichtblockierend Busy. Es
@@ -124,34 +131,54 @@ Klang mit einer Periode starten.
 
 Interrupts und Arbeit
 ---------------------
-Der Treiber versucht MSI und faellt auf die gerouteten INTx-Leitungen zurueck.
-Die ISR prueft INTSTS/SD_STS, zaehlt BCIS, FIFOE und DESE, quittiert die W1C-
-Bits und plant genau eine zusammengefasste Driver-Work-Arbeit. In der ISR gibt
-es weder Allokation noch Wartefunktion, PCM-Kopie oder normalen Logstrom.
+Der Treiber versucht zuerst MSI. Ein INTx-Fallback wird nur aus der gueltigen
+PCI-Interrupt-Line zusammen mit einer belegten Pin-Nummer 1 bis 4 abgeleitet.
+Fehlt diese Evidenz, scheitert der IRQ-Pfad sichtbar; benachbarte GSI 16 bis 23
+werden niemals geraten oder registriert. Die ISR prueft INTSTS/SD_STS, zaehlt
+BCIS, FIFOE und DESE je Beobachtung genau einmal, quittiert exakt die gemeldeten
+W1C-Bits und legt FIFOE/DESE atomar fuer eine kontrollierte Recovery ab. In der
+ISR gibt es weder Allokation noch Wartefunktion, Completion-API, PCM-Kopie oder
+normalen Logstrom.
 DriverApi v20 uebergibt den Refill als absolute 10-ms-Deadline mit stabilem
 HDA-Geraeteschluessel und einem aus 2 ms abgeleiteten, auf hoechstens vier
 Ticks begrenzten Callbackbudget. Die Anforderung laeuft auf der getrennten
 EDF-Queue und dem einzelnen `r4d-audio`-Short-Completion-Worker statt in der
-normalen Driver-FIFO. Driver Work liest LPIB, gibt verbrauchte Perioden frei,
-fuellt nach und fuehrt eine angeforderte Recovery aus.
+normalen Driver-FIFO. Driver Work vergleicht DMA-Position und LPIB, gibt
+verbrauchte Perioden frei, fuellt nach und fuehrt eine angeforderte Recovery
+aus.
 Eine monotone IRQ-Generation schliesst das Abschlussfenster eines Refill-Jobs:
 Jeder Callback fuehrt genau einen begrenzten Durchlauf aus; waehrenddessen
 eingetroffene Arbeit erhaelt einen neuen Successor mit eigener Deadline oder
 gehoert bereits dem vom IRQ aufgenommenen Successor. Pro HDA ist hoechstens
-ein solcher Nachfolger gequeued.
-Der Backendstatus aktualisiert den Besitz ebenfalls direkt aus LPIB, bevor er
-den Fuellstand meldet. Damit bleibt die Producer-Taktung auch dann korrekt,
+ein solcher Nachfolger gequeued. Completion-Status und -Freigabe laufen
+ausschliesslich in Worker- oder Taskkontext und werden durch ein atomares
+Reap-Gate serialisiert. Shutdown uebernimmt dieses Gate, storniert oder joint
+jeden Handle und darf erst danach DMA freigeben.
+Der Backendstatus aktualisiert den Besitz ebenfalls direkt aus der
+plausibilisierten Position, bevor er den Fuellstand meldet. Damit bleibt die
+Producer-Taktung auch dann korrekt,
 wenn QEMU Interruptarbeit zusammenfasst oder verspaetet ausfuehrt.
 
 Unterlauf und Lebenszyklus
 --------------------------
-Ein Unterlauf entsteht nur, wenn LPIB in eine nicht vorbereitete Periode
-wechselt. Dann werden underruns und silence_refills getrennt von Upstream-
-Drops und Backendfehlern erhoeht. DESE fordert Recovery an, FIFOE bleibt ein
-sichtbarer Streamfehler. Nach einem Consumer-Sprung wird der Producer direkt
-hinter die aktuelle Hardwareperiode gesetzt. Bleibt jede Positionsbeobachtung
-fuer ein komplettes 640-ms-DMA-Fenster aus, wird der Descriptor kontrolliert
-gestoppt und zurueckgesetzt; alter Ringinhalt kann nicht wiederholt werden.
+Ein 128-Byte-ausgerichteter DMA-Positionspuffer enthaelt acht Byte je wirklich
+vorhandenem Streamdescriptor. Basis, 32-/64-Bit-Adressgrenze, Eintragsoffset,
+Enable und Readback werden geprueft; Reset und Shutdown loeschen beziehungsweise
+deaktivieren ihn vor Wiederverwendung oder Freigabe. Ist er nicht verfuegbar,
+ungueltig oder wiederholt zu weit von LPIB entfernt, ist LPIB der benannte
+Fallback. Positionen ausserhalb CBL werden nie in einen Ringindex umgesetzt.
+
+Ein Unterlauf entsteht nur, wenn die plausible Hardwareposition in eine nicht
+vorbereitete Periode wechselt. Dann werden underruns und silence_refills
+getrennt von Upstream-Drops und Backendfehlern erhoeht. Ein monotoner
+Fortschrittstracker misst die Zeit seit der letzten echten Bytebewegung;
+wiederholtes Lesen derselben Position kann den 640-ms-Freeze-Timer nicht
+verlaengern. Ring-Wrap ist gueltiger Fortschritt, ein fuer die verstrichene
+Zeit unmoeglicher Sprung oder ein Freeze fuehrt genau eine kontrollierte
+Recovery aus. FIFOE und DESE verwenden denselben begrenzten Recoverypfad.
+Dabei werden Softwarequeue und noch als ready markierte Ringperioden als
+verworfen bilanziert und vollstaendig geloescht, sodass kein stale PCM erneut
+abgespielt werden kann.
 
 Ein normaler Stream-Close und der Treiber-Shutdown drainieren verbleibende
 Nutzframes sowie drei Postroll-Perioden hoechstens 400 ms. Erst danach wird
@@ -187,7 +214,10 @@ Mehrcontrollerauswahl, Reset-/Timeoutzustaende, CORB/RIRB-Groessen und
 und die vollstaendige Nodegrenze. Zusaetzlich modellieren die Tests Short- und
 Long-Form-Connection-Lists samt Ranges, direkte und mehrstufige Routen,
 Zyklen/Fehlkanten, analoge Pinrangfolge, Format-/Power-Capabilities, exakte
-Selector-/Mixer-/Amp-/EAPD-Verben und Pin-Sense-Fallbacks. Die
-End-to-End-Abnahme erfolgt
+Selector-/Mixer-/Amp-/EAPD-Verben und Pin-Sense-Fallbacks. Eigene Modelle
+decken Output-/Bidi-Descriptorauswahl, Positionspufferlayout, LPIB-Fallback,
+Quellenabweichung, Wrap, Freeze und unmoegliche Spruenge sowie exakte W1C-
+Zaehler, FIFOE-/DESE-Recovery, belegte INTx-Routen, atomare Recovery-Uebergabe
+und Worker-/Task-Reaping ohne IRQ-Kontext ab. Die End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.

@@ -75,6 +75,22 @@ pub fn build(b: *std.Build) void {
     const codec_program_tests = b.addTest(.{ .root_module = codec_program_tests_module });
     const run_codec_program_tests = b.addRunArtifact(codec_program_tests);
 
+    const stream_hardware_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/stream_hardware.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const stream_hardware_tests = b.addTest(.{ .root_module = stream_hardware_tests_module });
+    const run_stream_hardware_tests = b.addRunArtifact(stream_hardware_tests);
+
+    const irq_recovery_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/irq_recovery.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const irq_recovery_tests = b.addTest(.{ .root_module = irq_recovery_tests_module });
+    const run_irq_recovery_tests = b.addRunArtifact(irq_recovery_tests);
+
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ring_tests.step);
@@ -85,4 +101,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_codec_inventory_tests.step);
     test_step.dependOn(&run_codec_topology_tests.step);
     test_step.dependOn(&run_codec_program_tests.step);
+    test_step.dependOn(&run_stream_hardware_tests.step);
+    test_step.dependOn(&run_irq_recovery_tests.step);
 }

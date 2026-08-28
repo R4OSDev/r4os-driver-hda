@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.9`
+- Version: `0.3.10`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA 0.3.9 enumerates every bounded PCI class-04/03 candidate and selects a
+HDA 0.3.10 enumerates every bounded PCI class-04/03 candidate and selects a
 complete analog-capable controller from codec evidence instead of accepting
 the first function. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
@@ -38,6 +38,13 @@ pins are checked through bounded status polling; without usable jack evidence
 the selected speaker/line-out/headphone fallback remains fixed and visible in
 the driver log.
 
+The hardware stream is selected within the exact GCAP descriptor range. A
+dedicated output descriptor is preferred; a bidirectional descriptor is used
+only with its output-direction bit and only after route and 48-kHz stereo S16
+capabilities agree. A 128-byte-aligned DMA position buffer is validated
+against LPIB with deterministic fallback. Movement, wrap, frozen positions
+and impossible jumps are tracked independently of status-poll frequency.
+
 ## Build
 
 On Windows:
@@ -57,15 +64,18 @@ mapped local checkouts.
 
 The driver uses a 64-period DMA ring, starts after two ready 10 ms periods,
 and has a separate software PCM queue. Caller packets are joined without
-normal-path zero padding; BDL, CBL
-and LVI remain unchanged while RUN is set. MSI is preferred with INTx as the
-fallback, and the ISR delegates refill and recovery to bounded Driver Work.
+normal-path zero padding; BDL, CBL and LVI remain unchanged while RUN is set.
+MSI is preferred; INTx is accepted only from the exact PCI line/pin evidence
+and never guessed from neighboring GSIs. The ISR acknowledges BCIS/FIFOE/DESE
+once and delegates refill and controlled error recovery to bounded Driver Work.
 Each pass declares a 10 ms deadline, a stable HDA key, and a bounded callback
 budget on the isolated DriverApi-v20 audio lane. A callback performs one pass
 and submits at most one freshly deadline-stamped successor. Stream-Close
 drains short tails and joins every outstanding Driver-Work completion after
 releasing the stream lock, so the shared queue returns to zero retained HDA
-slots while idle.
+slots while idle. Completion inspection and release are serialized outside
+IRQ context, and shutdown joins all retained work before position, ring or BDL
+DMA is disabled and freed.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`. The normative
 project-wide stream contract and reference comparison live in
