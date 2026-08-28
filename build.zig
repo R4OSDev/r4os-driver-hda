@@ -91,6 +91,14 @@ pub fn build(b: *std.Build) void {
     const irq_recovery_tests = b.addTest(.{ .root_module = irq_recovery_tests_module });
     const run_irq_recovery_tests = b.addRunArtifact(irq_recovery_tests);
 
+    const lifecycle_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/lifecycle.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_tests_module });
+    const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
+
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_ring_tests.step);
@@ -103,4 +111,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_codec_program_tests.step);
     test_step.dependOn(&run_stream_hardware_tests.step);
     test_step.dependOn(&run_irq_recovery_tests.step);
+    test_step.dependOn(&run_lifecycle_tests.step);
 }

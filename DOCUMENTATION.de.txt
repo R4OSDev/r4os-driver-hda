@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.10
+﻿HDA.R4D 0.3.11
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -190,6 +190,20 @@ ausstehende Refill-Arbeit und gibt auch die letzte retained Completion frei.
 Stop, Fehler, Close und Shutdown benutzen idempotenten Abbau und raeumen
 ausstehende Driver-Work-Handles auf.
 
+Der Besitz wird parallel zu den konkreten Handles fuer PCI, MMIO, Reset,
+Transport, Discovery, Route, Stream-/Positions-DMA, IRQ, Backend und Driver
+Work gefuehrt. Der Hosttest injiziert einen Fehler nach jeder Erwerbsstufe,
+prueft die Rueckwaertsreihenfolge und fuehrt denselben Abbau ein zweites Mal
+ohne weitere Freigabe aus. Ein weiterer Test baut danach eine vollstaendige
+frische Besitzgeneration auf und wieder ab; dabei darf kein PCM- oder
+Ressourcenbesitz aus der entladenen Generation ueberleben. Scheitert ein
+normaler Drain, stoppt der Treiber
+zusaetzlich erzwungen und loescht Queue, Ringbesitz und Resamplerzustand,
+bevor er den Drainfehler meldet. Kann dagegen IRQ/MSI, Driver Work oder
+Kommandotransport nicht sicher gequiesced werden, bleiben die zugehoerigen
+Handles fuer einen wiederholbaren Cleanup erhalten statt in aktive DMA hinein
+freigegeben zu werden.
+
 Beim Treiberabbau gilt strikt: Stream stoppen, Interruptquelle sperren,
 IRQ/MSI abmelden, Stream-Lock freigeben, Driver Work joinen, erst dann DMA
 freigeben und das
@@ -218,6 +232,9 @@ Selector-/Mixer-/Amp-/EAPD-Verben und Pin-Sense-Fallbacks. Eigene Modelle
 decken Output-/Bidi-Descriptorauswahl, Positionspufferlayout, LPIB-Fallback,
 Quellenabweichung, Wrap, Freeze und unmoegliche Spruenge sowie exakte W1C-
 Zaehler, FIFOE-/DESE-Recovery, belegte INTx-Routen, atomare Recovery-Uebergabe
-und Worker-/Task-Reaping ohne IRQ-Kontext ab. Die End-to-End-Abnahme erfolgt
+und Worker-/Task-Reaping ohne IRQ-Kontext ab. Das Lifecycle-Modell injiziert
+zusaetzlich Fehler nach allen elf Besitzstufen und prueft Drain-Timeout mit
+erzwungenem stale-PCM-Abbau sowie eine vollstaendige
+Unload-/Reload-Besitzgeneration. Die End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.

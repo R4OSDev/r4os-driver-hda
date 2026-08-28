@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.10`
+- Version: `0.3.11`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA 0.3.10 enumerates every bounded PCI class-04/03 candidate and selects a
+HDA 0.3.11 enumerates every bounded PCI class-04/03 candidate and selects a
 complete analog-capable controller from codec evidence instead of accepting
 the first function. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
@@ -76,6 +76,17 @@ releasing the stream lock, so the shared queue returns to zero retained HDA
 slots while idle. Completion inspection and release are serialized outside
 IRQ context, and shutdown joins all retained work before position, ring or BDL
 DMA is disabled and freed.
+
+An explicit ownership ledger covers PCI, MMIO, reset, transport, discovery,
+route, stream/position DMA, IRQ, backend and Driver Work. Partial
+initialization is unwound through the concrete handles and can be repeated
+without a second free. A failed graceful drain performs a forced stop that
+clears queued and DMA PCM before reporting the error; an IRQ, MSI, work or
+transport resource that cannot be proven quiescent remains owned for a later
+cleanup attempt. The supported owner unload/reload generation is modeled as a
+complete teardown followed by fresh reacquisition with no retained PCM. Two
+bounded `HDA.DIAG` records expose controller/route/format
+and runtime/recovery/timeout state without per-write or per-IRQ logging.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`. The normative
 project-wide stream contract and reference comparison live in
