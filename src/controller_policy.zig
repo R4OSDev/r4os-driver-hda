@@ -12,13 +12,15 @@ pub const Evidence = struct {
     output_converters: u16 = 0,
     analog_output_pins: u16 = 0,
     digital_output_pins: u16 = 0,
+    route_ready: bool = false,
 
     pub fn viable(self: Evidence) bool {
         return self.transport_ready and
             self.discovery_complete and
             self.codec_count != 0 and
             self.output_converters != 0 and
-            self.analog_output_pins != 0;
+            self.analog_output_pins != 0 and
+            self.route_ready;
     }
 };
 
@@ -68,6 +70,7 @@ test "later analog controller wins over first HDMI-only function" {
             .codec_count = 1,
             .output_converters = 2,
             .analog_output_pins = 2,
+            .route_ready = true,
         },
     };
     try std.testing.expectEqual(@as(?usize, 1), select(&candidates));
@@ -88,7 +91,7 @@ test "Lenovo L340 dual-controller identities select the later analog function" {
         .{
             .vendor_id = 0x1022,
             .device_id = 0x15E3,
-            .evidence = .{ .inventory_index = 7, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .output_converters = 2, .analog_output_pins = 2 },
+            .evidence = .{ .inventory_index = 7, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .output_converters = 2, .analog_output_pins = 2, .route_ready = true },
         },
     };
     const evidence = [_]Evidence{ lenovo[0].evidence, lenovo[1].evidence };
@@ -100,17 +103,29 @@ test "Lenovo L340 dual-controller identities select the later analog function" {
 
 test "incomplete or uncommandable candidates fail closed" {
     const candidates = [_]Evidence{
-        .{ .inventory_index = 1, .discovery_complete = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1 },
-        .{ .inventory_index = 2, .transport_ready = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1 },
+        .{ .inventory_index = 1, .discovery_complete = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1, .route_ready = true },
+        .{ .inventory_index = 2, .transport_ready = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1, .route_ready = true },
         .{ .inventory_index = 3, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .digital_output_pins = 1 },
     };
     try std.testing.expectEqual(@as(?usize, null), select(&candidates));
 }
 
+test "analog inventory without a proven route is not viable" {
+    const candidate = Evidence{
+        .inventory_index = 1,
+        .transport_ready = true,
+        .discovery_complete = true,
+        .codec_count = 1,
+        .output_converters = 2,
+        .analog_output_pins = 2,
+    };
+    try std.testing.expect(!candidate.viable());
+}
+
 test "ties keep canonical inventory order" {
     const candidates = [_]Evidence{
-        .{ .inventory_index = 9, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1 },
-        .{ .inventory_index = 4, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1 },
+        .{ .inventory_index = 9, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1, .route_ready = true },
+        .{ .inventory_index = 4, .transport_ready = true, .discovery_complete = true, .codec_count = 1, .output_converters = 1, .analog_output_pins = 1, .route_ready = true },
     };
     try std.testing.expectEqual(@as(?usize, 1), select(&candidates));
 }

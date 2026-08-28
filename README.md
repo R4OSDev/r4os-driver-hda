@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.8`
+- Version: `0.3.9`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA 0.3.8 enumerates every bounded PCI class-04/03 candidate and selects a
+HDA 0.3.9 enumerates every bounded PCI class-04/03 candidate and selects a
 complete analog-capable controller from codec evidence instead of accepting
 the first function. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
@@ -21,6 +21,22 @@ are used only when `OPTION HDA immediate=on` explicitly enables the visible
 fallback; `OPTION HDA corb=off` can be combined with it for diagnostics.
 Discovery covers all 15 codec addresses, every advertised audio function
 group and the complete valid eight-bit node space without silent truncation.
+
+Short- and long-form connection lists, including range entries, are expanded
+into a bounded per-codec graph. Controller evidence is viable only when this
+graph proves a complete analog pin-to-converter route whose widgets and PCM
+capabilities support 48-kHz stereo S16. Pin defaults rank speaker, headphone,
+and line-out routes deterministically by association and sequence; digital
+pins never enter that selection.
+
+The resulting verb plan powers the function group and required widgets to D0,
+clears and verifies the converter stream, programs and verifies format
+`0x0011`, configures every selected mixer/selector edge, derives unmuted 0-dB
+amplifier values from the advertised capabilities, enables EAPD only when
+supported, and finally assigns stream 1/channel 0. Presence-capable headphone
+pins are checked through bounded status polling; without usable jack evidence
+the selected speaker/line-out/headphone fallback remains fixed and visible in
+the driver log.
 
 ## Build
 

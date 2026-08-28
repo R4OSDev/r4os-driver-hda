@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.8
+﻿HDA.R4D 0.3.9
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -43,6 +43,52 @@ Immediate Command ist kein automatischer Ersatz. Nur
 den begrenzten, als `immediate-fallback` protokollierten Diagnoseweg. Mit
 `OPTION HDA corb=off` kann dieser Weg ausdruecklich erzwungen werden. Ohne
 Opt-in scheitert die Initialisierung statt den Transport still zu wechseln.
+
+Codecgraph und analoger Ausgabepfad
+-----------------------------------
+Jede Short- oder Long-Form-Connection-List wird vollstaendig gelesen. Range-
+Eintraege werden in ihrer normativen Reihenfolge expandiert; ein erster oder
+direkt auf einen Range-Eintrag folgender Range-Marker, rueckwaertige Bereiche,
+ungueltige NIDs und Kapazitaetsueberlauf machen die Liste unbrauchbar. Der
+resultierende gerichtete Codecgraph ist pro Codec begrenzt. Eine zyklensichere
+Breitensuche akzeptiert nur vollstaendig vorhandene, innerhalb derselben Audio
+Function Group liegende Pfade Pin -> Mixer/Selector -> analoger Stereo-DAC.
+Der exakte expandierte Connection-Index jedes Pfadsegments bleibt erhalten.
+
+Pin Config Default bestimmt Port Connectivity, Default Device, Association
+und Sequence. Nur Speaker, Headphone und Line Out sind analoge Kandidaten;
+SPDIF, HDMI und andere Digitalausgaenge werden nie als analoger Fallback
+verwendet. Innerhalb einer Rolle entscheiden eine vorhandene und danach die
+kleinere Association, die kleinere Sequence und zuletzt der kleinere NID.
+Standardmaessig gilt Speaker vor Headphone vor Line Out. Ein Controller ist
+erst auswahlfaehig, wenn mindestens ein so gerankter Pin einen vollstaendig
+programmierbaren Pfad besitzt. Ein blosses Inventar aus Pin und DAC reicht
+nicht mehr.
+
+Der DAC und jedes Pfadwidget muessen Stereo beherrschen. Der auf Widget- oder
+AFG-Ebene aufgeloeste PCM-Vertrag muss PCM, 48.000 Hz und 16 Bit ausweisen.
+Die Initialisierung setzt die AFG sowie alle power-faehigen Pfadwidgets auf D0
+und wartet zeitlich begrenzt auf den gemeldeten Istzustand. Danach wird der
+Converter-Stream auf null gesetzt und gelesen, Format 0x0011 gesetzt und
+gelesen, und erst nach der restlichen Pfadprogrammierung Stream 1/Kanal 0
+gesetzt und gelesen.
+
+Fuer jeden Selector wird der bewiesene Connection-Index gesetzt; fuer einen
+mehrdeutigen Pin ebenfalls. Am ausgewaehlten Mixer-/Selector-/Pin-Eingang und
+an jedem vorhandenen Ausgangsverstaerker werden beide Kanaele entmutet. Der
+0-dB-Gain stammt aus Offset und NumSteps der jeweiligen Amp Caps und wird auf
+den gemeldeten Bereich begrenzt; es gibt keinen festen Gainwert. EAPD wird nur
+bei gesetztem Pin-Capability-Bit aktiviert. Route und exakte Verbfolge werden
+begrenzt im Treiberlog ausgegeben.
+
+Ein Headphone-Pin mit Presence Detect und ohne Default-No-Presence liefert
+beim Start Pin Sense. Falls Trigger Required gesetzt ist, wird die Messung
+vorher ausgeloest. Der ohnehin vorhandene Backend-Status-/Schreibpfad prueft
+danach hoechstens alle 250 ms und wechselt unter dem Stream-Lock zwischen dem
+bewiesenen Headphone- und dem festen Speaker-/Line-Out-Pfad. Unsolicited
+Responses werden in dieser Unterversion nicht aktiviert; ihre IRQ-Haertung
+gehoert zu 0.71.8. Fehlt belastbare Jack-Evidenz, bleibt der feste Fallback
+sichtbar protokolliert.
 
 Format und Puffer
 -----------------
@@ -138,7 +184,10 @@ Startreserve, Periodenbesitz, Lueckenerkennung, Recovery, den
 IRQ-Generation-Gate mit genau einem Durchlauf und neuem Successor sowie
 Mehrcontrollerauswahl, Reset-/Timeoutzustaende, CORB/RIRB-Groessen und
 -Antworten, expliziten Immediate-Fallback, alle Codecadressen, mehrere AFGs
-und die vollstaendige Nodegrenze. Die
+und die vollstaendige Nodegrenze. Zusaetzlich modellieren die Tests Short- und
+Long-Form-Connection-Lists samt Ranges, direkte und mehrstufige Routen,
+Zyklen/Fehlkanten, analoge Pinrangfolge, Format-/Power-Capabilities, exakte
+Selector-/Mixer-/Amp-/EAPD-Verben und Pin-Sense-Fallbacks. Die
 End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.

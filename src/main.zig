@@ -6,6 +6,8 @@ const controller_policy = @import("controller_policy.zig");
 const controller_reset = @import("controller_reset.zig");
 const command_ring = @import("command_ring.zig");
 const codec_inventory = @import("codec_inventory.zig");
+const codec_topology = @import("codec_topology.zig");
+const codec_program = @import("codec_program.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("hda_init", "hda_shutdown"));
@@ -125,21 +127,50 @@ const PARAM_REVISION_ID: u8 = 0x02;
 const PARAM_SUB_NODE_COUNT: u8 = 0x04;
 const PARAM_FUNCTION_GROUP_TYPE: u8 = 0x05;
 const PARAM_AUDIO_WIDGET_CAPS: u8 = 0x09;
+const PARAM_PCM_SIZE_RATE: u8 = 0x0A;
+const PARAM_STREAM_FORMATS: u8 = 0x0B;
 const PARAM_PIN_CAPS: u8 = 0x0C;
+const PARAM_AMP_IN_CAPS: u8 = 0x0D;
 const PARAM_CONNECTION_LIST_LENGTH: u8 = 0x0E;
+const PARAM_POWER_STATES: u8 = 0x0F;
+const PARAM_AMP_OUT_CAPS: u8 = 0x12;
 const VERB_GET_CONFIG_DEFAULT: u16 = 0xF1C;
+const VERB_GET_STREAM_FORMAT: u16 = 0xA00;
+const VERB_GET_POWER_STATE: u16 = 0xF05;
+const VERB_GET_PIN_SENSE: u16 = 0xF09;
+const VERB_SET_STREAM_FORMAT: u16 = 0x2;
+const VERB_SET_AMP_GAIN_MUTE: u16 = 0x3;
+const VERB_SET_CONNECTION_SELECT: u16 = 0x701;
+const VERB_SET_POWER_STATE: u16 = 0x705;
+const VERB_SET_STREAM_CHANNEL: u16 = 0x706;
+const VERB_SET_PIN_CONTROL: u16 = 0x707;
+const VERB_SET_PIN_SENSE: u16 = 0x709;
+const VERB_SET_EAPD: u16 = 0x70C;
 const FUNCTION_GROUP_AUDIO: u8 = 0x01;
 const WIDGET_AUDIO_OUTPUT: u8 = 0x00;
 const WIDGET_AUDIO_MIXER: u8 = 0x02;
 const WIDGET_AUDIO_SELECTOR: u8 = 0x03;
 const WIDGET_PIN_COMPLEX: u8 = 0x04;
+const WIDGET_CAP_STEREO: u32 = 1 << 0;
+const WIDGET_CAP_IN_AMP: u32 = 1 << 1;
 const WIDGET_CAP_OUT_AMP: u32 = 1 << 2;
+const WIDGET_CAP_AMP_OVERRIDE: u32 = 1 << 3;
+const WIDGET_CAP_FORMAT_OVERRIDE: u32 = 1 << 4;
+const WIDGET_CAP_CONNECTION_LIST: u32 = 1 << 8;
+const WIDGET_CAP_DIGITAL: u32 = 1 << 9;
+const WIDGET_CAP_POWER: u32 = 1 << 10;
+const PIN_CAP_TRIGGER_REQUIRED: u32 = 1 << 1;
+const PIN_CAP_PRESENCE_DETECT: u32 = 1 << 2;
+const PIN_CAP_HEADPHONE_DRIVE: u32 = 1 << 3;
 const PIN_CAP_OUTPUT: u32 = 1 << 4;
 const PIN_CAP_EAPD: u32 = 1 << 16;
 const PIN_CONTROL_OUT_ENABLE: u8 = 0x40;
-const EAPD_BTL_ENABLE: u8 = 0x02;
+const PIN_CONTROL_HEADPHONE_ENABLE: u8 = 0x80;
+const PIN_SENSE_PRESENCE: u32 = 1 << 31;
+const PIN_DEFAULT_NO_PRESENCE: u32 = 1 << 8;
 const FIRST_STREAM_ID: u8 = 1;
 const FIRST_CHANNEL_ID: u8 = 0;
+const JACK_POLL_MS: u64 = 250;
 const PIN_DEFAULT_DEVICE_SHIFT: u5 = 20;
 const PIN_DEFAULT_DEVICE_MASK: u32 = 0x0F;
 const PIN_DEFAULT_CONNECTIVITY_SHIFT: u5 = 30;
@@ -178,6 +209,21 @@ const WidgetInfo = struct {
     caps: u32 = 0,
     pin_caps: u32 = 0,
     pin_config: u32 = 0,
+    pcm_caps: u32 = 0,
+    stream_caps: u32 = 0,
+    amp_in_caps: u32 = 0,
+    amp_out_caps: u32 = 0,
+    power_caps: u32 = 0,
+};
+
+const AfgInfo = struct {
+    present: bool = false,
+    node: u8 = 0,
+    pcm_caps: u32 = 0,
+    stream_caps: u32 = 0,
+    amp_in_caps: u32 = 0,
+    amp_out_caps: u32 = 0,
+    power_caps: u32 = 0,
 };
 
 const CodecInfo = struct {
@@ -197,7 +243,9 @@ const CodecInfo = struct {
     pin_count: u16 = 0,
     mixer_count: u16 = 0,
     selector_count: u16 = 0,
+    afgs: [MAX_CODEC_NODES]AfgInfo = .{AfgInfo{}} ** MAX_CODEC_NODES,
     widgets: [MAX_CODEC_NODES]WidgetInfo = .{WidgetInfo{}} ** MAX_CODEC_NODES,
+    topology: codec_topology.Graph = .{},
 };
 
 const OutputCandidate = struct {
@@ -210,6 +258,10 @@ const OutputCandidate = struct {
     pin_widget_caps: u32 = 0,
     pin_caps: u32 = 0,
     pin_config: u32 = 0,
+    role: codec_program.PinRole = .line_out,
+    pcm_caps: u32 = 0,
+    stream_caps: u32 = 0,
+    route: codec_topology.Route = .{},
 };
 
 const BdlEntry = extern struct {
@@ -272,6 +324,7 @@ const State = struct {
     rirb_read_pointer: u16 = 0,
     codec_ready: bool = false,
     output: OutputCandidate = .{},
+    output_routes: [3]OutputCandidate = .{OutputCandidate{}} ** 3,
     output_path_ok: bool = false,
     output_path_fail_count: u64 = 0,
     output_stream_id: u8 = 0,
@@ -282,6 +335,13 @@ const State = struct {
     output_eapd_set: bool = false,
     output_converter_unmuted: bool = false,
     output_pin_unmuted: bool = false,
+    output_program_operations: u16 = 0,
+    jack_sense: codec_program.JackSense = .unavailable,
+    jack_poll_supported: bool = false,
+    jack_next_poll_tick: u64 = 0,
+    jack_poll_count: u64 = 0,
+    jack_switch_count: u64 = 0,
+    jack_switch_fail_count: u64 = 0,
     dma_ready: bool = false,
     stream_desc_index: u8 = 0xFF,
     stream_desc_offset: u64 = 0,
@@ -364,6 +424,7 @@ const State = struct {
 
 var state: State = .{};
 var pcm_queue_storage: [PCM_QUEUE_BYTES]u8 = undefined;
+var route_program_plan: codec_program.ProgramPlan = .{};
 
 // 0.56.40: hz-neutrale Laufzeit-Umrechnung (R4D kennt DEFAULT_HZ nicht
 // comptime; timerFrequency liefert die echte Tickrate).
@@ -557,6 +618,7 @@ fn collectControllerEvidence(inventory_index: u32) controller_policy.Evidence {
         .output_converters = outputs,
         .analog_output_pins = analog,
         .digital_output_pins = digital,
+        .route_ready = state.output.found,
     };
 }
 
@@ -611,6 +673,13 @@ fn clearControllerCandidateState() void {
     state.rirb_read_pointer = 0;
     state.codec_ready = false;
     state.output = .{};
+    state.output_routes = .{OutputCandidate{}} ** 3;
+    state.jack_sense = .unavailable;
+    state.jack_poll_supported = false;
+    state.jack_next_poll_tick = 0;
+    state.jack_poll_count = 0;
+    state.jack_switch_count = 0;
+    state.jack_switch_fail_count = 0;
     clearCodecInfo();
     clearOutputPath();
 }
@@ -859,7 +928,8 @@ fn discoverCodecs(ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn discoverCodec(ctx: *const r4os.r4dev.DriverContext, addr: u8) bool {
-    var info = CodecInfo{};
+    const info = &state.codecs[@intCast(addr)];
+    info.* = .{};
     info.present = true;
     info.address = addr;
     info.vendor_id = getParameter(addr, 0, PARAM_VENDOR_ID) orelse return false;
@@ -878,12 +948,21 @@ fn discoverCodec(ctx: *const r4os.r4dev.DriverContext, addr: u8) bool {
 
         if (!codec_inventory.appendAudioFunctionGroup(&info.afg_nodes, &info.afg_count, fg_node)) return false;
         if (info.afg_node == 0) info.afg_node = fg_node;
+        info.afgs[fg_node] = .{
+            .present = true,
+            .node = fg_node,
+            .pcm_caps = getParameter(addr, fg_node, PARAM_PCM_SIZE_RATE) orelse return false,
+            .stream_caps = getParameter(addr, fg_node, PARAM_STREAM_FORMATS) orelse return false,
+            .amp_in_caps = getParameter(addr, fg_node, PARAM_AMP_IN_CAPS) orelse return false,
+            .amp_out_caps = getParameter(addr, fg_node, PARAM_AMP_OUT_CAPS) orelse return false,
+            .power_caps = getParameter(addr, fg_node, PARAM_POWER_STATES) orelse return false,
+        };
         const widget_nodes = getParameter(addr, fg_node, PARAM_SUB_NODE_COUNT) orelse return false;
-        if (!discoverWidgets(addr, fg_node, widget_nodes, &info)) return false;
+        if (!discoverWidgets(addr, fg_node, widget_nodes, info)) return false;
     }
 
-    state.codecs[@intCast(addr)] = info;
-    logCodecInfo(ctx, &state.codecs[@intCast(addr)]);
+    if (!discoverWidgetConnections(addr, info)) return false;
+    logCodecInfo(ctx, info);
     return true;
 }
 
@@ -905,6 +984,23 @@ fn discoverWidgets(addr: u8, afg_node: u8, nodes: u32, info: *CodecInfo) bool {
             .kind = kind,
             .caps = caps,
         };
+        if (!info.topology.setNode(node, afg_node, kind, caps)) return false;
+        const afg = info.afgs[afg_node];
+        if ((caps & WIDGET_CAP_IN_AMP) != 0) {
+            info.widgets[index].amp_in_caps = if ((caps & WIDGET_CAP_AMP_OVERRIDE) != 0)
+                getParameter(addr, node, PARAM_AMP_IN_CAPS) orelse return false
+            else
+                afg.amp_in_caps;
+        }
+        if ((caps & WIDGET_CAP_OUT_AMP) != 0) {
+            info.widgets[index].amp_out_caps = if ((caps & WIDGET_CAP_AMP_OVERRIDE) != 0)
+                getParameter(addr, node, PARAM_AMP_OUT_CAPS) orelse return false
+            else
+                afg.amp_out_caps;
+        }
+        if ((caps & WIDGET_CAP_POWER) != 0) {
+            info.widgets[index].power_caps = getParameter(addr, node, PARAM_POWER_STATES) orelse return false;
+        }
         if (kind == WIDGET_PIN_COMPLEX) {
             info.widgets[index].pin_caps = getParameter(addr, node, PARAM_PIN_CAPS) orelse return false;
             info.widgets[index].pin_config = getPinConfig(addr, node) orelse return false;
@@ -915,6 +1011,14 @@ fn discoverWidgets(addr: u8, afg_node: u8, nodes: u32, info: *CodecInfo) bool {
                 if (isDigitalOutputDevice(device)) info.digital_output_pin_count += 1;
             }
         } else if (kind == WIDGET_AUDIO_OUTPUT) {
+            info.widgets[index].pcm_caps = if ((caps & WIDGET_CAP_FORMAT_OVERRIDE) != 0)
+                getParameter(addr, node, PARAM_PCM_SIZE_RATE) orelse return false
+            else
+                afg.pcm_caps;
+            info.widgets[index].stream_caps = if ((caps & WIDGET_CAP_FORMAT_OVERRIDE) != 0)
+                getParameter(addr, node, PARAM_STREAM_FORMATS) orelse return false
+            else
+                afg.stream_caps;
             info.output_count += 1;
         } else if (kind == WIDGET_AUDIO_MIXER) {
             info.mixer_count += 1;
@@ -926,9 +1030,44 @@ fn discoverWidgets(addr: u8, afg_node: u8, nodes: u32, info: *CodecInfo) bool {
     return true;
 }
 
+fn discoverWidgetConnections(addr: u8, info: *CodecInfo) bool {
+    var node_index: usize = 0;
+    while (node_index < info.widgets.len) : (node_index += 1) {
+        const widget = info.widgets[node_index];
+        if (!widget.present or (widget.caps & WIDGET_CAP_CONNECTION_LIST) == 0) continue;
+        const list_info = getParameter(addr, widget.node, PARAM_CONNECTION_LIST_LENGTH) orelse return false;
+        const count: usize = @intCast(list_info & 0x7f);
+        const long_form = (list_info & 0x80) != 0;
+        var encoded = [_]u16{0} ** 127;
+        var cached_offset: u8 = 0xff;
+        var cached_block: u32 = 0;
+        var index: usize = 0;
+        while (index < count) : (index += 1) {
+            const aligned: u8 = if (long_form)
+                @intCast(index & ~@as(usize, 1))
+            else
+                @intCast(index & ~@as(usize, 3));
+            if (aligned != cached_offset) {
+                cached_block = sendVerb(makeVerb(addr, widget.node, 0xF02, aligned)) orelse return false;
+                cached_offset = aligned;
+            }
+            const shift: u5 = if (long_form)
+                @intCast((index & 1) * 16)
+            else
+                @intCast((index & 3) * 8);
+            encoded[index] = if (long_form)
+                @truncate((cached_block >> shift) & 0xffff)
+            else
+                @truncate((cached_block >> shift) & 0xff);
+        }
+        if (!info.topology.addEncodedConnectionList(widget.node, long_form, encoded[0..count])) return false;
+    }
+    return true;
+}
+
 fn chooseOutputCandidate(ctx: *const r4os.r4dev.DriverContext) void {
     state.output = .{};
-    var best_rank: u8 = 0;
+    state.output_routes = .{OutputCandidate{}} ** 3;
     var codec_index: usize = 0;
     while (codec_index < state.codecs.len) : (codec_index += 1) {
         const info = &state.codecs[codec_index];
@@ -936,36 +1075,93 @@ fn chooseOutputCandidate(ctx: *const r4os.r4dev.DriverContext) void {
         var pin_index: usize = 0;
         while (pin_index < info.widgets.len) : (pin_index += 1) {
             const pin = info.widgets[pin_index];
-            if (!pin.present or pin.kind != WIDGET_PIN_COMPLEX or (pin.pin_caps & PIN_CAP_OUTPUT) == 0) continue;
-            if (!pinIsConnected(pin.pin_config)) continue;
-            const rank = analogPinRank(pin.pin_config);
-            if (rank == 0 or rank < best_rank) continue;
-            const converter = firstOutputConverterForAfg(info, pin.afg_node) orelse continue;
-            if (rank == best_rank and state.output.found) continue;
-            best_rank = rank;
-            state.output = .{
+            if (!pin.present or pin.kind != WIDGET_PIN_COMPLEX or
+                (pin.pin_caps & PIN_CAP_OUTPUT) == 0 or (pin.caps & WIDGET_CAP_STEREO) == 0) continue;
+            const role = codec_program.pinRole(pin.pin_config) orelse continue;
+            var allowed_converters = [_]bool{false} ** MAX_CODEC_NODES;
+            var output_index: usize = 0;
+            while (output_index < info.widgets.len) : (output_index += 1) {
+                const output = info.widgets[output_index];
+                allowed_converters[output_index] = output.present and output.afg_node == pin.afg_node and
+                    output.kind == WIDGET_AUDIO_OUTPUT and
+                    codec_program.supportsRequiredFormat(output.caps, output.pcm_caps, output.stream_caps);
+            }
+            const route = info.topology.findAnalogOutputRouteWithConverters(pin.node, &allowed_converters) orelse continue;
+            if (route.count > codec_program.max_route_nodes) continue;
+            const converter = route.converter();
+            const converter_widget = info.widgets[converter];
+            if (!codec_program.supportsRequiredFormat(converter_widget.caps, converter_widget.pcm_caps, converter_widget.stream_caps)) continue;
+            const candidate = OutputCandidate{
                 .found = true,
                 .codec = info.address,
                 .afg = pin.afg_node,
                 .converter = converter,
-                .converter_caps = widgetCaps(info, converter),
+                .converter_caps = converter_widget.caps,
                 .pin = pin.node,
                 .pin_widget_caps = pin.caps,
                 .pin_caps = pin.pin_caps,
                 .pin_config = pin.pin_config,
+                .role = role,
+                .pcm_caps = converter_widget.pcm_caps,
+                .stream_caps = converter_widget.stream_caps,
+                .route = route,
             };
+            if (buildOutputPlan(candidate) == null) continue;
+            const route_index = outputRouteIndex(role);
+            const current = state.output_routes[route_index];
+            const current_pin: ?codec_program.PinCandidate = if (current.found)
+                .{ .node = current.pin, .config = current.pin_config, .pin_caps = current.pin_caps }
+            else
+                null;
+            const candidate_pin = codec_program.PinCandidate{ .node = pin.node, .config = pin.pin_config, .pin_caps = pin.pin_caps };
+            if (codec_program.preferPin(candidate_pin, current_pin)) state.output_routes[route_index] = candidate;
         }
     }
+
+    state.jack_sense = readHeadphoneSense(ctx);
+    const role = codec_program.chooseActiveRole(
+        state.output_routes[outputRouteIndex(.speaker)].found,
+        state.output_routes[outputRouteIndex(.headphone)].found,
+        state.output_routes[outputRouteIndex(.line_out)].found,
+        state.jack_sense,
+    );
+    if (role) |selected_role| state.output = state.output_routes[outputRouteIndex(selected_role)];
+    state.jack_next_poll_tick = ctx.tickCount() +| msTicks(ctx, JACK_POLL_MS);
     if (state.output.found) {
         logOutputCandidate(ctx);
+        logJackPolicy(ctx);
     } else {
-        ctx.logWarn("HDA.R4D no analog output candidate");
+        ctx.logWarn("HDA.R4D no complete analog output route");
     }
 }
 
-fn widgetCaps(info: *const CodecInfo, node: u8) u32 {
-    const widget = info.widgets[@intCast(node)];
-    return if (widget.present) widget.caps else 0;
+fn outputRouteIndex(role: codec_program.PinRole) usize {
+    return @intFromEnum(role);
+}
+
+fn readHeadphoneSense(ctx: *const r4os.r4dev.DriverContext) codec_program.JackSense {
+    const candidate = state.output_routes[outputRouteIndex(.headphone)];
+    if (!candidate.found or
+        (candidate.pin_caps & PIN_CAP_PRESENCE_DETECT) == 0 or
+        (candidate.pin_config & PIN_DEFAULT_NO_PRESENCE) != 0)
+    {
+        state.jack_poll_supported = false;
+        return .unavailable;
+    }
+    if ((candidate.pin_caps & PIN_CAP_TRIGGER_REQUIRED) != 0) {
+        if (sendVerb(makeVerb(candidate.codec, candidate.pin, VERB_SET_PIN_SENSE, 0)) == null) {
+            state.jack_poll_supported = false;
+            return .unavailable;
+        }
+        ctx.waitTicks(1);
+    }
+    const response = sendVerb(makeVerb(candidate.codec, candidate.pin, VERB_GET_PIN_SENSE, 0)) orelse {
+        state.jack_poll_supported = false;
+        return .unavailable;
+    };
+    state.jack_poll_supported = true;
+    state.jack_poll_count +%= 1;
+    return if ((response & PIN_SENSE_PRESENCE) != 0) .present else .absent;
 }
 
 fn clearOutputPath() void {
@@ -979,6 +1175,7 @@ fn clearOutputPath() void {
     state.output_eapd_set = false;
     state.output_converter_unmuted = false;
     state.output_pin_unmuted = false;
+    state.output_program_operations = 0;
 }
 
 fn configureOutputPath(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -989,33 +1186,152 @@ fn configureOutputPath(ctx: *const r4os.r4dev.DriverContext) bool {
         return false;
     }
 
+    if (!programOutputCandidate(ctx, state.output)) {
+        state.output_path_fail_count += 1;
+        noteHdaWarn(ctx, "codec route verb plan failed");
+        return false;
+    }
+    return true;
+}
+
+fn buildOutputPlan(candidate: OutputCandidate) ?codec_program.ProgramPlan {
+    if (!candidate.found or candidate.codec >= state.codecs.len) return null;
+    const info = &state.codecs[candidate.codec];
+    const route_count: usize = candidate.route.count;
+    if (!info.present or route_count < 2 or route_count > codec_program.max_route_nodes) return null;
+    const afg = info.afgs[candidate.afg];
+    if (!afg.present) return null;
+    var input = codec_program.PlanInput{
+        .afg = candidate.afg,
+        .afg_power_caps = afg.power_caps,
+        .pin_caps = candidate.pin_caps,
+        .pin_role = candidate.role,
+        .pcm_caps = candidate.pcm_caps,
+        .stream_caps = candidate.stream_caps,
+        .route_count = @intCast(route_count),
+    };
+    var index: usize = 0;
+    while (index < route_count) : (index += 1) {
+        const node = candidate.route.nodes[index];
+        const widget = info.widgets[node];
+        if (!widget.present or widget.afg_node != candidate.afg) return null;
+        input.route[index] = .{
+            .node = node,
+            .kind = widget.kind,
+            .widget_caps = widget.caps,
+            .input_amp_caps = widget.amp_in_caps,
+            .output_amp_caps = widget.amp_out_caps,
+            .power_caps = widget.power_caps,
+            .connection_index = if (index + 1 < route_count) candidate.route.connection_indices[index] else 0,
+            .connection_count = info.topology.edge_count[node],
+        };
+    }
+    return codec_program.buildPlan(&input);
+}
+
+fn programOutputCandidate(ctx: *const r4os.r4dev.DriverContext, candidate: OutputCandidate) bool {
+    route_program_plan = buildOutputPlan(candidate) orelse return false;
+    for (route_program_plan.slice()) |operation| {
+        if (!executeOutputOperation(ctx, candidate.codec, operation)) return false;
+    }
+    state.output = candidate;
     state.output_stream_id = FIRST_STREAM_ID;
     state.output_channel_id = FIRST_CHANNEL_ID;
-    state.output_pin_control = PIN_CONTROL_OUT_ENABLE;
-
-    if (!setConverterStreamChannel(state.output.codec, state.output.converter, state.output_stream_id, state.output_channel_id)) {
-        state.output_path_fail_count += 1;
-        noteHdaWarn(ctx, "converter stream/channel setup failed");
-        return false;
-    }
-    if (findConnectionIndex(state.output.codec, state.output.pin, state.output.converter)) |connection_index| {
-        state.output_connection_index = connection_index;
-        state.output_connection_set = setConnectionSelect(state.output.codec, state.output.pin, connection_index);
-    }
-    if (!setPinControl(state.output.codec, state.output.pin, state.output_pin_control)) {
-        state.output_path_fail_count += 1;
-        noteHdaWarn(ctx, "pin output enable failed");
-        return false;
-    }
-    if ((state.output.pin_caps & PIN_CAP_EAPD) != 0) {
-        state.output_eapd_set = setEapd(state.output.codec, state.output.pin);
-    }
-    state.output_converter_unmuted = unmuteOutput(state.output.codec, state.output.converter, state.output.converter_caps);
-    state.output_pin_unmuted = unmuteOutput(state.output.codec, state.output.pin, state.output.pin_widget_caps);
-
+    state.output_pin_control = PIN_CONTROL_OUT_ENABLE |
+        (if (candidate.role == .headphone and (candidate.pin_caps & PIN_CAP_HEADPHONE_DRIVE) != 0) PIN_CONTROL_HEADPHONE_ENABLE else 0);
+    state.output_connection_index = candidate.route.connection_indices[0];
+    state.output_connection_set = candidate.route.count > 1;
+    state.output_eapd_set = (candidate.pin_caps & PIN_CAP_EAPD) != 0;
+    state.output_converter_unmuted = (candidate.converter_caps & WIDGET_CAP_OUT_AMP) != 0;
+    state.output_pin_unmuted = (candidate.pin_widget_caps & (WIDGET_CAP_IN_AMP | WIDGET_CAP_OUT_AMP)) != 0;
+    state.output_program_operations = route_program_plan.count;
     state.output_path_ok = true;
     logOutputPath(ctx);
     return true;
+}
+
+fn executeOutputOperation(ctx: *const r4os.r4dev.DriverContext, codec: u8, operation: codec_program.Operation) bool {
+    return switch (operation.kind) {
+        .set_power_d0 => sendVerb(makeVerb(codec, operation.node, VERB_SET_POWER_STATE, 0)) != null,
+        .verify_power_d0 => waitPowerD0(ctx, codec, operation.node),
+        .clear_stream, .set_stream => sendVerb(makeVerb(codec, operation.node, VERB_SET_STREAM_CHANNEL, @truncate(operation.value))) != null,
+        .verify_stream => blk: {
+            const response = sendVerb(makeVerb(codec, operation.node, 0xF06, 0)) orelse break :blk false;
+            break :blk @as(u8, @truncate(response)) == @as(u8, @truncate(operation.value));
+        },
+        .set_format => blk: {
+            ctx.waitTicks(1);
+            break :blk sendVerb(makeLongVerb(codec, operation.node, VERB_SET_STREAM_FORMAT, operation.value)) != null;
+        },
+        .verify_format => blk: {
+            const response = sendVerb(makeVerb(codec, operation.node, VERB_GET_STREAM_FORMAT, 0)) orelse break :blk false;
+            break :blk @as(u16, @truncate(response)) == operation.value;
+        },
+        .set_connection => sendVerb(makeVerb(codec, operation.node, VERB_SET_CONNECTION_SELECT, @truncate(operation.value))) != null,
+        .set_amp => sendVerb(makeLongVerb(codec, operation.node, VERB_SET_AMP_GAIN_MUTE, operation.value)) != null,
+        .set_pin_control => sendVerb(makeVerb(codec, operation.node, VERB_SET_PIN_CONTROL, @truncate(operation.value))) != null,
+        .set_eapd => sendVerb(makeVerb(codec, operation.node, VERB_SET_EAPD, @truncate(operation.value))) != null,
+    };
+}
+
+fn waitPowerD0(ctx: *const r4os.r4dev.DriverContext, codec: u8, node: u8) bool {
+    const deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS);
+    while (true) {
+        const response = sendVerb(makeVerb(codec, node, VERB_GET_POWER_STATE, 0)) orelse return false;
+        if ((response & 0x100) != 0) return false;
+        if (((response >> 4) & 0x0f) == 0) return true;
+        if (ctx.tickCount() >= deadline) return false;
+        ctx.waitTicks(1);
+    }
+}
+
+fn deactivateOutputCandidate(candidate: OutputCandidate) bool {
+    if (!candidate.found) return true;
+    const converter_stopped = setConverterStreamChannel(candidate.codec, candidate.converter, 0, 0);
+    const pin_disabled = setPinControl(candidate.codec, candidate.pin, 0);
+    return converter_stopped and pin_disabled;
+}
+
+fn switchOutputCandidate(ctx: *const r4os.r4dev.DriverContext, candidate: OutputCandidate) bool {
+    if (!candidate.found) return false;
+    if (state.output.found and state.output.codec == candidate.codec and state.output.pin == candidate.pin and state.output.converter == candidate.converter) return true;
+    const previous = state.output;
+    if (!deactivateOutputCandidate(previous)) {
+        state.jack_switch_fail_count +%= 1;
+        return false;
+    }
+    if (programOutputCandidate(ctx, candidate)) {
+        state.jack_switch_count +%= 1;
+        return true;
+    }
+    state.jack_switch_fail_count +%= 1;
+    if (previous.found) _ = programOutputCandidate(ctx, previous);
+    return false;
+}
+
+fn pollJackAndSwitch(ctx: *const r4os.r4dev.DriverContext) void {
+    if (!state.jack_poll_supported) return;
+    const now = ctx.tickCount();
+    if (now < state.jack_next_poll_tick) return;
+    state.jack_next_poll_tick = now +| msTicks(ctx, JACK_POLL_MS);
+    const sense = readHeadphoneSense(ctx);
+    if (sense == state.jack_sense) return;
+    const role = codec_program.chooseActiveRole(
+        state.output_routes[outputRouteIndex(.speaker)].found,
+        state.output_routes[outputRouteIndex(.headphone)].found,
+        state.output_routes[outputRouteIndex(.line_out)].found,
+        sense,
+    ) orelse return;
+    if (state.output.role == role) {
+        state.jack_sense = sense;
+        logJackPolicy(ctx);
+        return;
+    }
+    const candidate = state.output_routes[outputRouteIndex(role)];
+    if (switchOutputCandidate(ctx, candidate)) {
+        state.jack_sense = sense;
+        logJackPolicy(ctx);
+    }
 }
 
 fn setupStreamDma(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -1375,6 +1691,7 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     if (!acquireStream(&ctx, 100)) return finishWrite(-6, write_start);
     defer releaseStream();
     if (@atomicLoad(bool, &state.shutting_down, .acquire)) return finishWrite(-1, write_start);
+    pollJackAndSwitch(&ctx);
     const input = data[0..@as(usize, @intCast(len))];
     const output_frames = pcm.outputFrameCount(input.len, rate, channels, format);
     if (output_frames == 0) {
@@ -1449,6 +1766,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
     // writer; the next status or IRQ job will observe the position instead.
     if (@atomicLoad(bool, &state.present, .acquire) and state.dma_ready and tryAcquireStream()) {
         var ctx = context();
+        pollJackAndSwitch(&ctx);
         refreshPlaybackPosition(&ctx);
         fillDmaPeriods(&ctx);
         startPlaybackIfNeeded();
@@ -1832,39 +2150,6 @@ fn setPinControl(codec: u8, node: u8, control: u8) bool {
     return sendVerb(makeVerb(codec, node, 0x707, control)) != null;
 }
 
-fn setConnectionSelect(codec: u8, node: u8, index: u8) bool {
-    return sendVerb(makeVerb(codec, node, 0x701, index)) != null;
-}
-
-fn setEapd(codec: u8, node: u8) bool {
-    return sendVerb(makeVerb(codec, node, 0x70C, EAPD_BTL_ENABLE)) != null;
-}
-
-fn unmuteOutput(codec: u8, node: u8, caps: u32) bool {
-    if ((caps & WIDGET_CAP_OUT_AMP) == 0) return false;
-    const payload: u16 = 0xB000 | 0x40;
-    return sendVerb(makeLongVerb(codec, node, 0x3, payload)) != null;
-}
-
-fn findConnectionIndex(codec: u8, pin_node: u8, target_node: u8) ?u8 {
-    const list_info = getParameter(codec, pin_node, PARAM_CONNECTION_LIST_LENGTH) orelse return null;
-    const count: u8 = @truncate(list_info & 0x7F);
-    const long_form = (list_info & 0x80) != 0;
-    if (count == 0) return null;
-
-    var index: u8 = 0;
-    while (index < count) : (index += 1) {
-        const command_index = if (long_form) index & 0xFE else index & 0xFC;
-        const entry_block = sendVerb(makeVerb(codec, pin_node, 0xF02, command_index)) orelse return null;
-        const entry_node: u16 = if (long_form)
-            @truncate((entry_block >> @as(u5, @truncate((index & 1) * 16))) & 0xFFFF)
-        else
-            @truncate((entry_block >> @as(u5, @truncate((index & 3) * 8))) & 0xFF);
-        if (entry_node == target_node) return index;
-    }
-    return null;
-}
-
 fn sendVerb(verb: u32) ?u32 {
     if (state.transport_mode == .corb_rirb) return sendCorbVerb(verb);
     if (state.transport_mode == .immediate) {
@@ -2025,25 +2310,6 @@ fn isAnalogOutputDevice(device: u8) bool {
 
 fn isDigitalOutputDevice(device: u8) bool {
     return device == PIN_DEVICE_SPDIF_OUT or device == PIN_DEVICE_DIGITAL_OTHER_OUT;
-}
-
-fn analogPinRank(config: u32) u8 {
-    if (!pinIsConnected(config)) return 0;
-    return switch (pinDefaultDevice(config)) {
-        PIN_DEVICE_SPEAKER => 3,
-        PIN_DEVICE_HEADPHONE => 2,
-        PIN_DEVICE_LINE_OUT => 1,
-        else => 0,
-    };
-}
-
-fn firstOutputConverterForAfg(info: *const CodecInfo, afg_node: u8) ?u8 {
-    var index: usize = 0;
-    while (index < info.widgets.len) : (index += 1) {
-        const widget = info.widgets[index];
-        if (widget.present and widget.afg_node == afg_node and widget.kind == WIDGET_AUDIO_OUTPUT) return widget.node;
-    }
-    return null;
 }
 
 fn countBits16(value: u16) u8 {
@@ -2274,6 +2540,8 @@ fn logControllerCandidate(
     appendDec(&line, &len, evidence.analog_output_pins);
     appendText(&line, &len, " digital=");
     appendDec(&line, &len, evidence.digital_output_pins);
+    appendText(&line, &len, " route=");
+    appendText(&line, &len, if (evidence.route_ready) "yes" else "no");
     logLine(ctx, &line, len);
 }
 
@@ -2310,7 +2578,7 @@ fn logCodecInfo(ctx: *const r4os.r4dev.DriverContext, info: *const CodecInfo) vo
 }
 
 fn logOutputCandidate(ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [112:0]u8 = undefined;
+    var line: [192:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D output candidate codec=");
     appendDec(&line, &len, state.output.codec);
@@ -2320,11 +2588,19 @@ fn logOutputCandidate(ctx: *const r4os.r4dev.DriverContext) void {
     appendDec(&line, &len, state.output.converter);
     appendText(&line, &len, " pin=");
     appendDec(&line, &len, state.output.pin);
+    appendText(&line, &len, " role=");
+    appendText(&line, &len, outputRoleName(state.output.role));
+    appendText(&line, &len, " assoc=");
+    appendDec(&line, &len, codec_program.association(state.output.pin_config));
+    appendText(&line, &len, " seq=");
+    appendDec(&line, &len, codec_program.sequence(state.output.pin_config));
+    appendText(&line, &len, " depth=");
+    appendDec(&line, &len, state.output.route.count);
     logLine(ctx, &line, len);
 }
 
 fn logOutputPath(ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [144:0]u8 = undefined;
+    var line: [224:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D output path codec=");
     appendDec(&line, &len, state.output.codec);
@@ -2336,9 +2612,99 @@ fn logOutputPath(ctx: *const r4os.r4dev.DriverContext) void {
     appendDec(&line, &len, state.output.pin);
     appendText(&line, &len, " stream=");
     appendDec(&line, &len, state.output_stream_id);
+    appendText(&line, &len, " format=0x");
+    appendHex(&line, &len, HDA_FORMAT_48K_STEREO_S16, 4);
+    appendText(&line, &len, " verbs=");
+    appendDec(&line, &len, state.output_program_operations);
     appendText(&line, &len, " eapd=");
     appendText(&line, &len, if (state.output_eapd_set) "yes" else "no");
     logLine(ctx, &line, len);
+    logOutputRoute(ctx);
+    logOutputVerbPlan(ctx);
+}
+
+fn logOutputRoute(ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [320:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.R4D route ");
+    var index: usize = 0;
+    while (index < state.output.route.count) : (index += 1) {
+        if (index != 0) appendText(&line, &len, ">");
+        appendDec(&line, &len, state.output.route.nodes[index]);
+        if (index + 1 < state.output.route.count) {
+            appendText(&line, &len, "[");
+            appendDec(&line, &len, state.output.route.connection_indices[index]);
+            appendText(&line, &len, "]");
+        }
+    }
+    logLine(ctx, &line, len);
+}
+
+fn logOutputVerbPlan(ctx: *const r4os.r4dev.DriverContext) void {
+    const operations = route_program_plan.slice();
+    var start: usize = 0;
+    while (start < operations.len) {
+        var line: [256:0]u8 = undefined;
+        var len: usize = 0;
+        appendText(&line, &len, "HDA.R4D verb plan ");
+        appendDec(&line, &len, start);
+        appendText(&line, &len, ":");
+        const end = @min(start + 8, operations.len);
+        var index = start;
+        while (index < end) : (index += 1) {
+            const operation = operations[index];
+            appendText(&line, &len, " ");
+            appendText(&line, &len, operationName(operation.kind));
+            appendText(&line, &len, "@");
+            appendDec(&line, &len, operation.node);
+            appendText(&line, &len, "=0x");
+            appendHex(&line, &len, operation.value, 4);
+        }
+        logLine(ctx, &line, len);
+        start = end;
+    }
+}
+
+fn logJackPolicy(ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [176:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.R4D jack sense=");
+    appendText(&line, &len, switch (state.jack_sense) {
+        .unavailable => "unavailable-fixed-fallback",
+        .absent => "absent",
+        .present => "present",
+    });
+    appendText(&line, &len, " active=");
+    appendText(&line, &len, outputRoleName(state.output.role));
+    appendText(&line, &len, " polling=");
+    appendText(&line, &len, if (state.jack_poll_supported) "status-250ms" else "off");
+    appendText(&line, &len, " switches=");
+    appendDec(&line, &len, state.jack_switch_count);
+    logLine(ctx, &line, len);
+}
+
+fn outputRoleName(role: codec_program.PinRole) []const u8 {
+    return switch (role) {
+        .line_out => "line-out",
+        .speaker => "speaker",
+        .headphone => "headphone",
+    };
+}
+
+fn operationName(kind: codec_program.OperationKind) []const u8 {
+    return switch (kind) {
+        .set_power_d0 => "pwr",
+        .verify_power_d0 => "pwr?",
+        .clear_stream => "stream0",
+        .verify_stream => "stream?",
+        .set_format => "fmt",
+        .verify_format => "fmt?",
+        .set_connection => "select",
+        .set_amp => "amp",
+        .set_pin_control => "pin",
+        .set_eapd => "eapd",
+        .set_stream => "stream",
+    };
 }
 
 fn logStreamDma(ctx: *const r4os.r4dev.DriverContext) void {
