@@ -280,6 +280,17 @@ const OutputCandidate = struct {
     route: codec_topology.Route = .{},
 };
 
+const ControllerCandidateSnapshot = struct {
+    present: bool = false,
+    bus: u8 = 0,
+    device: u8 = 0,
+    function: u8 = 0,
+    vendor_id: u16 = 0,
+    device_id: u16 = 0,
+    interrupt_line: u8 = 0,
+    evidence: controller_policy.Evidence = .{},
+};
+
 const BdlEntry = extern struct {
     addr: u64 = 0,
     length: u32 = 0,
@@ -298,6 +309,7 @@ const State = struct {
     mmio: r4os.abi.MmioRegion = .{},
     controller_candidate_count: u8 = 0,
     controller_rejected_count: u8 = 0,
+    controller_candidates: [MAX_CONTROLLER_CANDIDATES]ControllerCandidateSnapshot = .{ControllerCandidateSnapshot{}} ** MAX_CONTROLLER_CANDIDATES,
     selected_inventory_index: u32 = ~@as(u32, 0),
     backend: r4os.abi.AudioBackend = .{},
     backend_registered: bool = false,
@@ -424,7 +436,6 @@ const State = struct {
     converted_frame_count: u64 = 0,
     last_result: i32 = 0,
     write_reject_logged: bool = false,
-    diagnostic_core_runtime_logged: bool = false,
     last_source_rate: u32 = 0,
     last_source_channels: u16 = 0,
     last_source_format: u16 = 0,
@@ -568,7 +579,18 @@ fn selectAndInitializeController(ctx: *const r4os.r4dev.DriverContext) bool {
         state.controller_candidate_count = @intCast(candidate_count);
 
         const evidence = probeControllerCandidate(ctx, info, inventory_index);
-        logControllerCandidate(ctx, info, evidence);
+        const snapshot = ControllerCandidateSnapshot{
+            .present = true,
+            .bus = info.bus,
+            .device = info.device,
+            .function = info.function,
+            .vendor_id = info.vendor_id,
+            .device_id = info.device_id,
+            .interrupt_line = info.interrupt_line,
+            .evidence = evidence,
+        };
+        state.controller_candidates[candidate_count - 1] = snapshot;
+        logControllerCandidate(ctx, snapshot);
         if (controller_policy.prefer(evidence, best_evidence)) {
             best_evidence = evidence;
             best_info = info;
@@ -1994,10 +2016,8 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     releaseStream();
     if (!stopped) return setLastResult(-1);
     if (!releaseDriverWork(&ctx)) return setLastResult(-1);
-    if (!state.diagnostic_core_runtime_logged) {
-        logDiagnosticCore(&ctx);
-        state.diagnostic_core_runtime_logged = true;
-    }
+    logControllerSelectionEvidence(&ctx);
+    logDiagnosticCore(&ctx);
     logDiagnosticRuntime(&ctx, "close");
     return setLastResult(if (decision.report_failure) -1 else 0);
 }
@@ -2865,32 +2885,46 @@ fn logTransport(ctx: *const r4os.r4dev.DriverContext, codec: u8, vendor_id: u32)
 
 fn logControllerCandidate(
     ctx: *const r4os.r4dev.DriverContext,
-    info: r4os.abi.PciDeviceInfo,
-    evidence: controller_policy.Evidence,
+    candidate: ControllerCandidateSnapshot,
 ) void {
-    var line: [192:0]u8 = undefined;
+    var line: [256:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D controller candidate index=");
-    appendDec(&line, &len, evidence.inventory_index);
+    appendDec(&line, &len, candidate.evidence.inventory_index);
     appendText(&line, &len, " pci=");
-    appendDec(&line, &len, info.bus);
+    appendDec(&line, &len, candidate.bus);
     appendText(&line, &len, ":");
-    appendDec(&line, &len, info.device);
+    appendDec(&line, &len, candidate.device);
     appendText(&line, &len, ".");
-    appendDec(&line, &len, info.function);
+    appendDec(&line, &len, candidate.function);
+    appendText(&line, &len, " vendor=0x");
+    appendHex(&line, &len, candidate.vendor_id, 4);
+    appendText(&line, &len, " device=0x");
+    appendHex(&line, &len, candidate.device_id, 4);
+    appendText(&line, &len, " irq=");
+    appendDec(&line, &len, candidate.interrupt_line);
     appendText(&line, &len, " transport=");
-    appendText(&line, &len, if (evidence.transport_ready) "yes" else "no");
+    appendText(&line, &len, if (candidate.evidence.transport_ready) "yes" else "no");
     appendText(&line, &len, " complete=");
-    appendText(&line, &len, if (evidence.discovery_complete) "yes" else "no");
+    appendText(&line, &len, if (candidate.evidence.discovery_complete) "yes" else "no");
     appendText(&line, &len, " codecs=");
-    appendDec(&line, &len, evidence.codec_count);
+    appendDec(&line, &len, candidate.evidence.codec_count);
     appendText(&line, &len, " analog=");
-    appendDec(&line, &len, evidence.analog_output_pins);
+    appendDec(&line, &len, candidate.evidence.analog_output_pins);
     appendText(&line, &len, " digital=");
-    appendDec(&line, &len, evidence.digital_output_pins);
+    appendDec(&line, &len, candidate.evidence.digital_output_pins);
     appendText(&line, &len, " route=");
-    appendText(&line, &len, if (evidence.route_ready) "yes" else "no");
+    appendText(&line, &len, if (candidate.evidence.route_ready) "yes" else "no");
     logLine(ctx, &line, len);
+}
+
+fn logControllerSelectionEvidence(ctx: *const r4os.r4dev.DriverContext) void {
+    var index: usize = 0;
+    while (index < state.controller_candidate_count) : (index += 1) {
+        const candidate = state.controller_candidates[index];
+        if (candidate.present) logControllerCandidate(ctx, candidate);
+    }
+    logSelectedController(ctx);
 }
 
 fn logSelectedController(ctx: *const r4os.r4dev.DriverContext) void {

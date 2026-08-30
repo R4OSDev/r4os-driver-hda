@@ -1,0 +1,95 @@
+R4OS HDA 0.71.10 - Lenovo IdeaPad L340-15API
+================================================
+
+This form records physical observations. Empty fields are not a pass.
+
+Operator:
+Date/time and timezone:
+Image SHA-256:
+Boot medium:
+Headphones (model/connector):
+
+Boot isolation (only if the HDA-enabled image did not reach Desktop)
+--------------------------------------------------------------------
+HDA-enabled image SHA-256:
+Observed loading-bar position/photo:
+HDA-disabled isolation image SHA-256:
+Isolation cold boot reached Desktop: PASS / FAIL
+Wired address supplied before any audio command:
+Isolation HWDIAG collected:
+Conclusion (HDA boundary confirmed / HDA not isolated / incomplete):
+
+Cold boot
+---------
+Power-off duration:
+Boot reached prompt: PASS / FAIL
+1002:15DE BDF and candidate result:
+1022:15E3 BDF and candidate result:
+Selected controller and reason:
+Codec vendor/revision and AFG:
+Selected route (pin > converter, role, depth):
+Transport:
+IRQ mode/route:
+Position mode and observed progress:
+
+Listening
+---------
+BEEP.R4X on internal speaker: PASS / FAIL; observation:
+R4BASIC BEEP on internal speaker: PASS / FAIL; observation:
+R4BASIC PLAY on internal speaker: PASS / FAIL; observation:
+AudioDiag on internal speaker: PASS / FAIL; observation:
+Headphone insert and switch: PASS / FAIL; observation:
+BEEP.R4X on headphones: PASS / FAIL; observation:
+R4BASIC BEEP/PLAY on headphones: PASS / FAIL; observation:
+Headphone removal and speaker return: PASS / FAIL; observation:
+Desktop mute: PASS / FAIL; observation:
+Desktop low/high volume: PASS / FAIL; observation:
+
+Five-minute and lifecycle run
+-----------------------------
+AUDIOD /LONG run 1: PASS / FAIL; counters:
+AUDIOD /LONG run 2: PASS / FAIL; counters:
+AUDIOD /LONG run 3: PASS / FAIL; counters:
+AUDIOD /LONG run 4: PASS / FAIL; counters:
+AUDIOD /LONG run 5: PASS / FAIL; counters:
+AUDIOD default lifecycle/multiclient/restart: PASS / FAIL
+Artifacts, stale replay or audible gaps:
+Final HDA.DIAG run counters:
+
+Warm boot
+---------
+REBOOT reached prompt: PASS / FAIL
+Controller/codec/route unchanged or explained:
+Transport/IRQ/position:
+BEEP.R4X replay: PASS / FAIL
+R4BASIC BEEP/PLAY replay: PASS / FAIL
+AudioDiag replay: PASS / FAIL
+Errors/recovery/resource observations:
+
+Evidence files collected
+------------------------
+HDA-COLD-HWDIAG.TXT:
+HDA-COLD-BOOTLOG.TXT:
+HDA-COLD-AUDIOD-HDA.TXT:
+HDA-LONG-1-HDA.TXT:
+HDA-LONG-2-HDA.TXT:
+HDA-LONG-3-HDA.TXT:
+HDA-LONG-4-HDA.TXT:
+HDA-LONG-5-HDA.TXT:
+HDA-COLD-FINAL-HWDIAG.TXT:
+HDA-COLD-FINAL-HDA.TXT:
+HDA-COLD-FINAL-LOGS.TXT:
+HDA-WARM-HWDIAG.TXT:
+HDA-WARM-BOOTLOG.TXT:
+HDA-WARM-AUDIOD-HDA.TXT:
+HDA-WARM-LOGS.TXT:
+
+Deviation and quirk decision
+----------------------------
+Reproduced hardware deviation:
+Exact vendor/device/codec/subsystem binding:
+Minimal quirk required: YES / NO
+Reason:
+
+Final result: PASS / FAIL / INCOMPLETE
+Operator signature/date:

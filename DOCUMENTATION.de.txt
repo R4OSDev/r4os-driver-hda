@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.11
+﻿HDA.R4D 0.3.12
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -18,7 +18,12 @@ kanonische PCI-Inventarreihenfolge. Abgelehnte Kandidaten stoppen ihren
 Kommandotransport, geben CORB/RIRB-DMA frei und erhalten ihr urspruengliches
 PCI-Command-Wort zurueck; der ausgewaehlte Kandidat wird definiert neu
 initialisiert. Kandidat, Auswahl und Ablehnungszahl bleiben im Treiberlog
-sichtbar.
+sichtbar. Seit 0.3.12 behaelt der Treiber die begrenzte PCI-Identitaet und
+Probe-Evidenz aller Kandidaten und gibt Auswahl und Core unmittelbar neben
+jedem Close-Diagnoserecord erneut aus. AUDIOD kann dadurch auch nach vorherigen
+Audioanwendungen Vendor-/Device-ID, Transport, Discovery, analoge und digitale
+Pins sowie Routennachweis laufgebunden exportieren, bevor das begrenzte
+Logfenster weiterlaeuft.
 
 STATESTS wird fuer alle 15 gueltigen Codecadressen ausgewertet. Jeder
 gemeldete Codec muss vollstaendig antworten. Alle Audio Function Groups und
@@ -238,3 +243,22 @@ erzwungenem stale-PCM-Abbau sowie eine vollstaendige
 Unload-/Reload-Besitzgeneration. Die End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.
+
+Die abschliessende Lenovo-Abnahme wird mit
+`Tests/Prepare-HardwareAcceptanceImage.ps1` vorbereitet. Das Skript baut ein
+interaktives Full-Profil, ergaenzt dort ausschliesslich die testgebundenen
+AUDIOD-/HWDIAG-Artefakte sowie Batches und BAS-Hoerprobe, verifiziert und
+kopiert das Image samt Hashmanifest und stellt danach das normale Full-Profil
+wieder her. Es beschreibt oder flasht keinen Wechseldatentraeger. Das
+Image, sein QEMU-Boot oder historische Hardwaredaten ersetzen niemals die
+menschliche Speaker-/Kopfhoererbeobachtung aus
+Docs/Drivers/HdaHardwareAcceptance07110.txt.
+
+Bleibt ein HDA-aktivierter Hardwarestart vor dem Desktop stehen, erzeugt
+derselbe Ablauf mit `-IsolationNoHda` ein getrennt benanntes und
+manifestiertes Isolationsimage. Dessen temporaere CONFIG nimmt HDA aus der
+geordneten Treiberliste und setzt `DISABLE=HDA`, laesst das R4D-Artefakt aber
+unangetastet. Ein damit erreichter Desktop grenzt den konfigurierten
+HDA-Ladepfad ein, ist jedoch weder Audio- noch Hardwareabnahme. Vor einem
+Quirk muessen ueber HWDIAG und einen engeren Probeaufbau die genaue
+PCI-Funktion und die fehlschlagende Initialisierungsstufe belegt werden.

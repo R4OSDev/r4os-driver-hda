@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.11`
+- Version: `0.3.12`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA 0.3.11 enumerates every bounded PCI class-04/03 candidate and selects a
+HDA 0.3.12 enumerates every bounded PCI class-04/03 candidate and selects a
 complete analog-capable controller from codec evidence instead of accepting
 the first function. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
@@ -21,6 +21,10 @@ are used only when `OPTION HDA immediate=on` explicitly enables the visible
 fallback; `OPTION HDA corb=off` can be combined with it for diagnostics.
 Discovery covers all 15 codec addresses, every advertised audio function
 group and the complete valid eight-bit node space without silent truncation.
+The bounded controller snapshots include PCI identity and probe evidence and
+are emitted again beside every compact close diagnostic, so an acceptance
+tool can export the complete selection decision before the log window
+advances, even when other applications played audio first.
 
 Short- and long-form connection lists, including range entries, are expanded
 into a bounded per-codec graph. Controller evidence is viable only when this
@@ -93,6 +97,19 @@ project-wide stream contract and reference comparison live in
 `Docs/Drivers/HdaStreamContract.txt` and
 `Docs/Drivers/HdaReferenceComparison.txt`. Source-transfer provenance is
 recorded in `PROVENANCE.txt`.
+
+`Tests/Prepare-HardwareAcceptanceImage.ps1` prepares the interactive 0.71.10
+Lenovo acceptance image without flashing a device, preserves its hash-bound
+artifacts, adds the test-only audio/hardware diagnostics to a Full-profile
+image, and restores the normal Full profile afterward. The physical
+procedure and its strict evidence boundary are documented in
+`Docs/Drivers/HdaHardwareAcceptance07110.txt`.
+
+When an HDA-enabled physical boot stops before Desktop, the same script's
+`-IsolationNoHda` switch creates a separately named and manifested Full image
+whose temporary boot policy disables HDA without removing its artifact. It is
+only a cause-isolation image: a successful boot is not audio or hardware
+acceptance and must be followed by an identity- and stage-bound HDA probe.
 
 ## License
 
