@@ -76,6 +76,15 @@ pub const PositionChoice = struct {
     degradation: PositionDegradation = .none,
 };
 
+/// Compact runtime label for the position source actually used after
+/// plausibility checks.  A configured DMA buffer is not the same as an
+/// active DMA source once repeated disagreement selected the LPIB fallback.
+pub fn diagnosticPositionMode(dma_enabled: bool, dma_degraded: bool, source: PositionSource) []const u8 {
+    if (!dma_enabled) return "lpib-only";
+    if (dma_degraded) return "lpib-fallback";
+    return if (source == .dma) "dma+lpib" else "lpib-transient";
+}
+
 fn validPosition(position: u32, cbl: u32) bool {
     return cbl != 0 and position < cbl;
 }
@@ -198,6 +207,13 @@ test "DMA position and LPIB agree across wrap and degrade deterministically" {
     try std.testing.expectEqual(PositionDegradation.dma_invalid, choosePosition(cbl, 10, cbl, 1920, false).degradation);
     try std.testing.expectEqual(PositionDegradation.both_invalid, choosePosition(cbl, cbl, cbl, 1920, false).degradation);
     try std.testing.expectEqual(PositionDegradation.dma_unavailable, choosePosition(null, 10, cbl, 1920, false).degradation);
+}
+
+test "position diagnostic distinguishes configured DMA from active fallback" {
+    try std.testing.expectEqualStrings("lpib-only", diagnosticPositionMode(false, false, .lpib));
+    try std.testing.expectEqualStrings("dma+lpib", diagnosticPositionMode(true, false, .dma));
+    try std.testing.expectEqualStrings("lpib-transient", diagnosticPositionMode(true, false, .lpib));
+    try std.testing.expectEqualStrings("lpib-fallback", diagnosticPositionMode(true, true, .lpib));
 }
 
 test "status polling cannot mask freeze and wrap is real movement" {

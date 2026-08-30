@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.12`
+- Version: `0.3.13`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA 0.3.12 enumerates every bounded PCI class-04/03 candidate and selects a
+HDA 0.3.13 enumerates every bounded PCI class-04/03 candidate and selects a
 complete analog-capable controller from codec evidence instead of accepting
 the first function. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
@@ -48,6 +48,10 @@ only with its output-direction bit and only after route and 48-kHz stereo S16
 capabilities agree. A 128-byte-aligned DMA position buffer is validated
 against LPIB with deterministic fallback. Movement, wrap, frozen positions
 and impossible jumps are tracked independently of status-poll frequency.
+The compact close record reports the source actually used after these checks:
+configured DMA, transient LPIB use, persistent LPIB fallback, and LPIB-only
+operation remain distinct, with mismatch and fallback counters alongside the
+normal runtime counters.
 
 ## Build
 
@@ -98,11 +102,19 @@ project-wide stream contract and reference comparison live in
 `Docs/Drivers/HdaReferenceComparison.txt`. Source-transfer provenance is
 recorded in `PROVENANCE.txt`.
 
-`Tests/Prepare-HardwareAcceptanceImage.ps1` prepares the interactive 0.71.10
-Lenovo acceptance image without flashing a device, preserves its hash-bound
-artifacts, adds the test-only audio/hardware diagnostics to a Full-profile
-image, and restores the normal Full profile afterward. The physical
-procedure and its strict evidence boundary are documented in
+The physical 0.71.10 Lenovo acceptance completed on 30 August 2026. Cold and
+warm runs selected the analog `1022:15E3`/`10EC:0257` path and consistently
+reported `lpib-fallback pmis=3 pfb=3` with advancing writes and every stream,
+recovery, timeout and work-drop counter at zero. Internal-speaker playback,
+BEEP.R4X, R4BASIC BEEP/PLAY, AudioDiag, live volume and mute were heard;
+headphones were unavailable and remain explicitly untested. No device quirk
+is required.
+
+`Tests/Prepare-HardwareAcceptanceImage.ps1` prepares the interactive Lenovo
+acceptance image without flashing a device, preserves its hash-bound artifacts,
+adds the test-only audio/hardware diagnostics to a Full-profile image, and
+restores the normal Full profile afterward. The physical procedure, result
+and strict evidence boundary are documented in
 `Docs/Drivers/HdaHardwareAcceptance07110.txt`.
 
 When an HDA-enabled physical boot stops before Desktop, the same script's

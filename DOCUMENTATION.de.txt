@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.12
+﻿HDA.R4D 0.3.13
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -24,6 +24,15 @@ jedem Close-Diagnoserecord erneut aus. AUDIOD kann dadurch auch nach vorherigen
 Audioanwendungen Vendor-/Device-ID, Transport, Discovery, analoge und digitale
 Pins sowie Routennachweis laufgebunden exportieren, bevor das begrenzte
 Logfenster weiterlaeuft.
+
+Seit 0.3.13 beschreibt der kompakte Close-Record nicht mehr nur, ob ein
+DMA-Positionspuffer eingerichtet wurde, sondern welche plausibilisierte
+Positionsquelle tatsaechlich aktiv blieb. `dma+lpib`, `lpib-transient`,
+`lpib-fallback` und `lpib-only` sind getrennt; `pmis` und `pfb` machen
+Quellenabweichungen und Fallbackzaehler direkt in der laufgebundenen
+AUDIOD-Evidenz sichtbar. Die auf dem Lenovo beobachtete, funktionale
+Rueckstufung wird dadurch korrekt erklaert, ohne die bewiesene allgemeine
+Fallbacklogik durch einen unbegruendeten Geraetequirk zu ersetzen.
 
 STATESTS wird fuer alle 15 gueltigen Codecadressen ausgewertet. Jeder
 gemeldete Codec muss vollstaendig antworten. Alle Audio Function Groups und
@@ -235,7 +244,8 @@ Long-Form-Connection-Lists samt Ranges, direkte und mehrstufige Routen,
 Zyklen/Fehlkanten, analoge Pinrangfolge, Format-/Power-Capabilities, exakte
 Selector-/Mixer-/Amp-/EAPD-Verben und Pin-Sense-Fallbacks. Eigene Modelle
 decken Output-/Bidi-Descriptorauswahl, Positionspufferlayout, LPIB-Fallback,
-Quellenabweichung, Wrap, Freeze und unmoegliche Spruenge sowie exakte W1C-
+Quellenabweichung, die vier Diagnosemodi, Wrap, Freeze und unmoegliche
+Spruenge sowie exakte W1C-
 Zaehler, FIFOE-/DESE-Recovery, belegte INTx-Routen, atomare Recovery-Uebergabe
 und Worker-/Task-Reaping ohne IRQ-Kontext ab. Das Lifecycle-Modell injiziert
 zusaetzlich Fehler nach allen elf Besitzstufen und prueft Drain-Timeout mit
@@ -244,14 +254,23 @@ Unload-/Reload-Besitzgeneration. Die End-to-End-Abnahme erfolgt
 mit AUDIOD und dem QEMU-WAV-Auswerter. Der reproduzierbare Referenzbestand
 liegt lokal unter ExFiles/Reference/Hardware/HDA und wird nicht ausgeliefert.
 
-Die abschliessende Lenovo-Abnahme wird mit
-`Tests/Prepare-HardwareAcceptanceImage.ps1` vorbereitet. Das Skript baut ein
+Die abschliessende Lenovo-Abnahme wurde am 30. August 2026 mit
+`Tests/Prepare-HardwareAcceptanceImage.ps1` vorbereitet und auf einem IdeaPad
+L340-15API bestanden. Kalt und warm wurden beide HDA-Funktionen, der
+ausgewaehlte Analogpfad `1022:15E3`/`10EC:0257`, Route `20>2`, CORB/RIRB, MSI
+und die fortschreitende LPIB-Position belegt. Sechs Close-Zyklen je Boot
+meldeten `lpib-fallback pmis=3 pfb=3` bei durchgehend null Stream-, Recovery-
+und Workfehlern. Lautsprecher, BEEP.R4X, R4BASIC BEEP/PLAY, AudioDiag,
+Lautstaerke und Mute wurden gehoert; Kopfhoerer bleiben mangels Testgeraet
+ausdruecklich ungetestet. Ein Geraetequirk ist nicht erforderlich.
+
+Das Vorbereitungsskript baut ein
 interaktives Full-Profil, ergaenzt dort ausschliesslich die testgebundenen
 AUDIOD-/HWDIAG-Artefakte sowie Batches und BAS-Hoerprobe, verifiziert und
 kopiert das Image samt Hashmanifest und stellt danach das normale Full-Profil
 wieder her. Es beschreibt oder flasht keinen Wechseldatentraeger. Das
 Image, sein QEMU-Boot oder historische Hardwaredaten ersetzen niemals die
-menschliche Speaker-/Kopfhoererbeobachtung aus
+menschliche Hoerbeobachtung aus
 Docs/Drivers/HdaHardwareAcceptance07110.txt.
 
 Bleibt ein HDA-aktivierter Hardwarestart vor dem Desktop stehen, erzeugt

@@ -3257,7 +3257,15 @@ fn logDiagnosticRuntime(ctx: *const r4os.r4dev.DriverContext, phase: []const u8)
     appendText(&line, &len, " irq=");
     appendText(&line, &len, if (state.irq_mode == 2) "msi" else if (state.irq_mode == 1) "intx" else "none");
     appendText(&line, &len, " pos=");
-    appendText(&line, &len, if (state.position_dma_enabled) "dma+lpib" else "lpib");
+    appendText(&line, &len, stream_hardware.diagnosticPositionMode(
+        state.position_dma_enabled,
+        state.position_dma_degraded,
+        state.position_source,
+    ));
+    appendText(&line, &len, " pmis=");
+    appendDec(&line, &len, state.position_source_mismatch_count);
+    appendText(&line, &len, " pfb=");
+    appendDec(&line, &len, state.position_fallback_count);
     appendText(&line, &len, " wr=");
     appendDec(&line, &len, state.write_count);
     appendText(&line, &len, " und=");
