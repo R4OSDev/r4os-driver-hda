@@ -1984,7 +1984,13 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
 
     state.resampler_state.beginChunk(rate, channels, format);
     var scratch: [DMA_BUFFER_BYTES]u8 = undefined;
-    while (!state.resampler_state.chunk_done) {
+    if (pcm.takeDirectChunk(&state.resampler_state, input, rate, channels, format, required_capacity)) |direct| {
+        if (!state.pcm_queue.writeAll(&pcm_queue_storage, direct)) {
+            state.queue_overflow_count += 1;
+            return finishWrite(-4, write_start);
+        }
+        state.last_output_bytes = direct.len;
+    } else while (!state.resampler_state.chunk_done) {
         const converted = pcm.convertStreamingToStereoS16(&state.resampler_state, input, rate, channels, format, &scratch);
         if (converted == 0) break;
         if (!state.pcm_queue.writeAll(&pcm_queue_storage, scratch[0..converted])) {
