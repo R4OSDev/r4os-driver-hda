@@ -1,4 +1,5 @@
 const std = @import("std");
+const hdmi = @import("hdmi.zig");
 
 pub const widget_audio_output: u8 = 0x00;
 pub const widget_audio_mixer: u8 = 0x02;
@@ -25,6 +26,7 @@ pub const PinRole = enum(u8) {
     line_out = 0,
     speaker = 1,
     headphone = 2,
+    hdmi = 3,
 };
 
 pub const PinCandidate = struct {
@@ -77,6 +79,7 @@ fn roleRank(role: PinRole) u8 {
         .speaker => 3,
         .headphone => 2,
         .line_out => 1,
+        .hdmi => 0,
     };
 }
 
@@ -97,8 +100,12 @@ pub fn chooseActiveRole(has_speaker: bool, has_headphone: bool, has_line_out: bo
 }
 
 pub fn supportsRequiredFormat(widget_caps: u32, pcm_caps: u32, stream_caps: u32) bool {
+    return supportsOutputFormat(widget_caps, pcm_caps, stream_caps, false);
+}
+
+pub fn supportsOutputFormat(widget_caps: u32, pcm_caps: u32, stream_caps: u32, digital: bool) bool {
     return (widget_caps & widget_cap_stereo) != 0 and
-        (widget_caps & widget_cap_digital) == 0 and
+        ((widget_caps & widget_cap_digital) != 0) == digital and
         (pcm_caps & pcm_rate_48k) != 0 and
         (pcm_caps & pcm_bits_16) != 0 and
         (stream_caps & stream_pcm) != 0;
@@ -163,6 +170,12 @@ pub const OperationKind = enum(u8) {
     set_pin_control,
     set_eapd,
     set_stream,
+    set_digital,
+    set_channel_count,
+    set_hdmi_slot,
+    set_dip_index,
+    set_dip_byte,
+    set_dip_xmit,
 };
 
 pub const Operation = struct {
@@ -196,7 +209,8 @@ pub fn buildPlan(input: *const PlanInput) ?ProgramPlan {
     const converter = input.route[count - 1];
     if (pin.node == 0 or pin.kind != widget_pin_complex or (input.pin_caps & pin_cap_output) == 0) return null;
     if (converter.node == 0 or converter.kind != widget_audio_output) return null;
-    if (!supportsRequiredFormat(converter.widget_caps, input.pcm_caps, input.stream_caps)) return null;
+    if (!supportsOutputFormat(converter.widget_caps, input.pcm_caps, input.stream_caps, input.pin_role == .hdmi)) return null;
+    if (input.pin_role == .hdmi and !hdmi.isDisplayPin(pin.widget_caps, input.pin_caps)) return null;
     if (input.afg_power_caps != 0 and (input.afg_power_caps & 1) == 0) return null;
 
     var plan = ProgramPlan{};
@@ -252,9 +266,71 @@ pub fn buildPlan(input: *const PlanInput) ?ProgramPlan {
         if (!plan.append(.{ .kind = .set_eapd, .node = pin.node, .value = 1 << 1 })) return null;
     }
     const stream_value: u16 = @as(u16, stream_id) << 4;
+    if (input.pin_role == .hdmi) {
+        if (!plan.append(.{ .kind = .set_digital, .node = converter.node, .value = 1 }) or
+            !plan.append(.{ .kind = .set_channel_count, .node = converter.node, .value = 1 })) return null;
+        // Unused HDMI slots are disabled; only channels 0/1 carry PCM.
+        for (0..8) |slot| {
+            const channel: u16 = if (slot < 2) @intCast(slot) else 15;
+            if (!plan.append(.{ .kind = .set_hdmi_slot, .node = pin.node, .value = (channel << 4) | @as(u16, @intCast(slot)) })) return null;
+        }
+        if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
+            !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node }) or
+            !plan.append(.{ .kind = .set_dip_index, .node = pin.node })) return null;
+        for (hdmi.stereoInfoFrame()) |byte| {
+            if (!plan.append(.{ .kind = .set_dip_byte, .node = pin.node, .value = byte })) return null;
+        }
+        if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
+            !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node, .value = 0xc0 })) return null;
+    }
     if (!plan.append(.{ .kind = .set_stream, .node = converter.node, .value = stream_value }) or
         !plan.append(.{ .kind = .verify_stream, .node = converter.node, .value = stream_value })) return null;
     return plan;
+}
+
+test "HDMI route sets digital PCM stereo mapping and complete infoframe before stream assignment" {
+    var input = PlanInput{
+        .afg = 1,
+        .pin_caps = pin_cap_output | hdmi.pin_cap_hdmi,
+        .pin_role = .hdmi,
+        .pcm_caps = pcm_rate_48k | pcm_bits_16,
+        .stream_caps = stream_pcm,
+        .route_count = 2,
+    };
+    input.route[0] = .{ .node = 4, .kind = widget_pin_complex, .widget_caps = widget_cap_stereo | widget_cap_digital, .connection_index = 1, .connection_count = 2 };
+    input.route[1] = .{ .node = 3, .kind = widget_audio_output, .widget_caps = widget_cap_stereo | widget_cap_digital };
+    const plan = buildPlan(&input).?;
+    var digital_seen = false;
+    var slots: usize = 0;
+    var packet: [14]u8 = undefined;
+    var bytes: usize = 0;
+    var transmitter_on = false;
+    for (plan.slice()) |op| switch (op.kind) {
+        .set_digital => {
+            try std.testing.expectEqual(@as(u16, 1), op.value);
+            digital_seen = true;
+        },
+        .set_channel_count => try std.testing.expectEqual(@as(u16, 1), op.value),
+        .set_hdmi_slot => {
+            try std.testing.expectEqual(@as(u16, @intCast(slots)), op.value & 15);
+            try std.testing.expectEqual(@as(u16, if (slots < 2) @intCast(slots) else 15), op.value >> 4);
+            slots += 1;
+        },
+        .set_dip_byte => {
+            try std.testing.expect(bytes < packet.len);
+            packet[bytes] = @intCast(op.value);
+            bytes += 1;
+        },
+        .set_dip_xmit => if (op.value != 0) {
+            try std.testing.expectEqual(@as(usize, 14), bytes);
+            transmitter_on = true;
+        },
+        .set_stream => try std.testing.expect(digital_seen and transmitter_on and slots == 8),
+        else => {},
+    };
+    try std.testing.expectEqualSlices(u8, &hdmi.stereoInfoFrame(), &packet);
+    input.route[1].widget_caps &= ~widget_cap_digital;
+    try std.testing.expect(buildPlan(&input) == null);
 }
 
 test "pin defaults rank analog outputs by role association sequence and NID" {

@@ -124,6 +124,10 @@ pub const Graph = struct {
     }
 
     pub fn findAnalogOutputRouteWithConverters(self: *const Graph, pin: u8, allowed_converters: *const [max_nodes]bool) ?Route {
+        return self.findOutputRouteWithConverters(pin, allowed_converters, false);
+    }
+
+    pub fn findOutputRouteWithConverters(self: *const Graph, pin: u8, allowed_converters: *const [max_nodes]bool, digital: bool) ?Route {
         if (pin == 0 or !self.present[pin] or self.kind[pin] != widget_pin_complex) return null;
         const route_afg = self.afg[pin];
         var visited = [_]bool{false} ** max_nodes;
@@ -145,7 +149,7 @@ pub const Graph = struct {
                 const source_kind = self.kind[source];
                 const is_converter = source_kind == widget_audio_output and
                     (self.caps[source] & widget_cap_stereo) != 0 and
-                    (self.caps[source] & widget_cap_digital) == 0 and
+                    ((self.caps[source] & widget_cap_digital) != 0) == digital and
                     allowed_converters[source];
                 const is_intermediate = (source_kind == widget_audio_mixer or source_kind == widget_audio_selector) and
                     (self.caps[source] & widget_cap_stereo) != 0;

@@ -13,13 +13,14 @@ pub const Evidence = struct {
     analog_output_pins: u16 = 0,
     digital_output_pins: u16 = 0,
     route_ready: bool = false,
+    connected_hdmi: bool = false,
 
     pub fn viable(self: Evidence) bool {
         return self.transport_ready and
             self.discovery_complete and
             self.codec_count != 0 and
             self.output_converters != 0 and
-            self.analog_output_pins != 0 and
+            (self.analog_output_pins != 0 or self.connected_hdmi) and
             self.route_ready;
     }
 };
@@ -30,6 +31,7 @@ pub fn prefer(candidate: Evidence, current: ?Evidence) bool {
     if (!candidate.viable()) return false;
     const best = current orelse return true;
     if (!best.viable()) return true;
+    if (candidate.connected_hdmi != best.connected_hdmi) return candidate.connected_hdmi;
     if (candidate.analog_output_pins != best.analog_output_pins) {
         return candidate.analog_output_pins > best.analog_output_pins;
     }
