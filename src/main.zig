@@ -437,6 +437,14 @@ const State = struct {
     tail_padding_frames: u64 = 0,
     drain_postroll_period_count: u64 = 0,
     underrun_count: u64 = 0,
+    idle_parked: bool = false,
+    idle_postroll: stream_ring.IdlePostroll = .{},
+    idle_stop_count: u64 = 0,
+    idle_resume_count: u64 = 0,
+    idle_tail_count: u64 = 0,
+    tail_start_pending: bool = false,
+    accepting_pcm: bool = false,
+    last_pcm_tick: u64 = 0,
     poll_count: u64 = 0,
     bcis_count: u64 = 0,
     fifo_error_count: u64 = 0,
@@ -1658,6 +1666,7 @@ fn clearPositionDmaEntry(state: *State) void {
 }
 
 fn resetPositionTracking(state: *State) void {
+    state.idle_postroll.reset();
     state.position_progress.reset();
     state.position_tick_valid = false;
     state.position_observed_tick = 0;
@@ -2122,6 +2131,9 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     state.last_output_bytes = 0;
     state.last_output_buffers = 0;
 
+    state.accepting_pcm = true;
+    defer state.accepting_pcm = false;
+
     refreshPlaybackPosition(state, &ctx);
     fillDmaPeriods(state, &ctx);
     if (state.playback_started and bufferedPlaybackPeriods(state) >= BUFFER_TARGET_PERIODS) {
@@ -2159,6 +2171,7 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
 
     state.converted_frame_count +%= state.last_output_bytes / pcm.TARGET_FRAME_BYTES;
     state.write_count += 1;
+    state.last_pcm_tick = ctx.tickCount();
     fillDmaPeriods(state, &ctx);
     startPlaybackIfNeeded(state);
     return finishWrite(state, 0, write_start);
@@ -2177,6 +2190,7 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     logControllerSelectionEvidence(state, &ctx);
     logDiagnosticCore(state, &ctx);
     logDiagnosticRuntime(state, &ctx, "close");
+    logIdleSummary(state, &ctx);
     return setLastResult(state, if (decision.report_failure) -1 else 0);
 }
 
@@ -2224,6 +2238,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
 
 fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     while (state.pcm_queue.used >= DMA_BUFFER_BYTES) {
+        state.idle_postroll.reset();
         const slot = state.periods.nextWritable() orelse break;
         const refill_start = ctx.tickCount();
         const out = dmaSlice(state, slot) orelse break;
@@ -2232,6 +2247,18 @@ fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
         state.last_output_buffers += 1;
         state.refill_count +%= 1;
         recordTickStat(state, &state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
+    }
+    // A short final write after an already parked ring has no completion IRQ.
+    // Existing active-session status observation can flush it once a whole
+    // period has elapsed; adjacent producer fragments still combine normally.
+    if (state.idle_parked and !state.accepting_pcm and !state.draining and state.periods.queued == 0 and
+        state.pcm_queue.used > 0 and state.pcm_queue.used < DMA_BUFFER_BYTES and
+        ctx.tickCount() -| state.last_pcm_tick >= msTicks(ctx, 10))
+    {
+        if (commitTailPeriod(state)) {
+            state.tail_start_pending = true;
+            state.idle_tail_count +%= 1;
+        }
     }
 }
 
@@ -2243,11 +2270,17 @@ fn bufferedPlaybackPeriods(state: *State) usize {
 fn flushTailPeriod(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     if (state.pcm_queue.used == 0) return true;
     refreshPlaybackPosition(state, ctx);
+    return commitTailPeriod(state);
+}
+
+fn commitTailPeriod(state: *State) bool {
+    if (state.pcm_queue.used == 0) return true;
     const slot = state.periods.nextWritable() orelse return false;
     const out = dmaSlice(state, slot) orelse return false;
     @memset(out, 0);
     const copied = state.pcm_queue.readAvailable(&state.pcm_queue_storage, out);
     if (copied == 0 or !state.periods.commit(slot)) return false;
+    state.idle_postroll.reset();
     state.tail_padding_frames +%= (DMA_BUFFER_BYTES - copied) / pcm.TARGET_FRAME_BYTES;
     state.last_output_buffers += 1;
     state.refill_count +%= 1;
@@ -2339,16 +2372,47 @@ fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext) 
         slot = (slot + 1) % DMA_BUFFER_COUNT;
     }
 
-    if (advance.missing > 0 and !state.draining) {
+    const completion = stream_ring.afterAdvance(advance, state.periods.queued, state.pcm_queue.used, DMA_BUFFER_BYTES, state.draining);
+    if (completion.underruns > 0) {
         const first_underrun = state.underrun_count == 0;
-        state.underrun_count +%= advance.missing;
-        state.silence_refill_count +%= advance.missing;
+        state.underrun_count +%= completion.underruns;
+        state.silence_refill_count +%= completion.underruns;
         state.underrun_active = true;
         state.last_error = "stream underrun";
         if (first_underrun) ctx.logWarn("HDA.R4D first stream underrun");
-    } else if (advance.missing == 0) {
+    } else {
         state.underrun_active = false;
     }
+    if (completion.tail and !state.accepting_pcm) {
+        if (commitTailPeriod(state)) {
+            state.idle_tail_count +%= 1;
+        } else {
+            state.error_count +%= 1;
+            state.last_error = "idle tail commit failed";
+        }
+    }
+    if (state.idle_postroll.observe(completion.park and state.periods.queued == 0 and state.pcm_queue.used == 0, advance.periods, DRAIN_POSTROLL_PERIODS)) {
+        _ = parkEmptyPlayback(state, ctx);
+    }
+}
+
+fn parkEmptyPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+    if (!state.playback_started or state.periods.queued != 0) return false;
+    // Stop DMA and completion IRQs before resetting ownership. Keep the
+    // source queue and resampler phase belonging to the open logical stream.
+    if (!resetStreamDescriptor(state, ctx)) {
+        state.error_count +%= 1;
+        _ = recoverStream(state, ctx, "idle descriptor reset failed");
+        return false;
+    }
+    clearStreamBuffers(state);
+    programStreamDescriptorRegisters(state);
+    state.playback_started = false;
+    state.periods.reset();
+    state.idle_parked = true;
+    state.idle_stop_count +%= 1;
+    updateStreamStatus(state);
+    return true;
 }
 
 fn readPositionDma(state: *State) ?u32 {
@@ -2409,11 +2473,14 @@ fn recoverPositionFailure(
 
 fn startPlaybackIfNeeded(state: *State) void {
     if (state.playback_started) return;
-    if (!stream_ring.readyToStart(state.periods.queued, PREFILL_PERIODS, state.draining) or !state.periods.start(0)) return;
+    if (!stream_ring.readyToStart(state.periods.queued, PREFILL_PERIODS, state.draining or state.tail_start_pending) or !state.periods.start(0)) return;
     resetPositionTracking(state);
     clearPositionDmaEntry(state);
     write32(state.stream_desc_base + SD_CTL, streamControlBase(state) | SD_CTL_IRQ_ENABLE | SD_CTL_RUN);
     state.playback_started = true;
+    if (state.idle_parked) state.idle_resume_count +%= 1;
+    state.idle_parked = false;
+    state.tail_start_pending = false;
     state.start_count += 1;
     updateStreamStatus(state);
 }
@@ -2455,6 +2522,14 @@ fn drainPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 
 fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
     if (!state.dma_ready or state.stream_desc_base == 0) return true;
+    if (state.idle_parked and state.periods.queued == 0 and state.pcm_queue.used == 0) {
+        state.resampler_state.reset();
+        state.idle_parked = false;
+        state.tail_start_pending = false;
+        state.draining = false;
+        state.stop_count += 1;
+        return true;
+    }
     if (drain) {
         if (!drainPlayback(state, ctx)) return false;
     } else {
@@ -2482,6 +2557,8 @@ fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool
     state.periods.reset();
     state.pcm_queue.clear();
     state.resampler_state.reset();
+    state.idle_parked = false;
+    state.tail_start_pending = false;
     state.stop_count += 1;
     updateStreamStatus(state);
     return true;
@@ -2492,6 +2569,8 @@ fn recoverStream(state: *State, ctx: *const r4os.r4dev.DriverContext, reason: [*
     state.stream_recovery_count += 1;
     state.last_recovery = reason;
     state.playback_started = false;
+    state.idle_parked = false;
+    state.tail_start_pending = false;
     resetPositionTracking(state);
     state.dropped_frame_count +%= state.pcm_queue.used / pcm.TARGET_FRAME_BYTES;
     state.dropped_frame_count +%= state.periods.queued * (DMA_BUFFER_BYTES / pcm.TARGET_FRAME_BYTES);
@@ -3289,6 +3368,32 @@ fn logInterruptSetup(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     appendDec(&line, &len, state.irq_routes[0]);
     appendText(&line, &len, " exact=");
     appendText(&line, &len, if (state.irq_mode == 2 or state.intx_route_exact) "yes" else "no");
+    logLine(ctx, &line, len);
+}
+
+fn logIdleSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [256:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.IDLE pci=");
+    appendHex(&line, &len, state.info.bus, 2);
+    appendText(&line, &len, ":");
+    appendHex(&line, &len, state.info.device, 2);
+    appendText(&line, &len, ".");
+    appendDec(&line, &len, state.info.function);
+    appendText(&line, &len, " stops=");
+    appendDec(&line, &len, state.idle_stop_count);
+    appendText(&line, &len, " resumes=");
+    appendDec(&line, &len, state.idle_resume_count);
+    appendText(&line, &len, " tails=");
+    appendDec(&line, &len, state.idle_tail_count);
+    appendText(&line, &len, " irq=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.irq_count, .acquire));
+    appendText(&line, &len, " work=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.irq_work_submitted, .acquire));
+    appendText(&line, &len, " padded=");
+    appendDec(&line, &len, state.tail_padding_frames);
+    appendText(&line, &len, " dropped=");
+    appendDec(&line, &len, state.dropped_frame_count);
     logLine(ctx, &line, len);
 }
 

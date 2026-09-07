@@ -55,6 +55,37 @@ pub const ByteQueue = struct {
 pub const Advance = struct {
     periods: usize = 0,
     missing: usize = 0,
+    starved: usize = 0,
+};
+
+pub const Completion = struct { underruns: usize = 0, park: bool = false, tail: bool = false };
+
+/// The PCM contract has no source deadline. Exhaustion means idle; holes
+/// before prepared data or a full software period waiting for DMA are
+/// measurable backend starvation. Flush a partial final period once.
+pub fn afterAdvance(advance: Advance, prepared: usize, pending_bytes: usize, period_bytes: usize, draining: bool) Completion {
+    if (advance.periods == 0 or draining) return .{};
+    const park = prepared == 0 and pending_bytes < period_bytes;
+    return .{ .underruns = @max(advance.starved, if (pending_bytes >= period_bytes) advance.missing else 0), .park = park, .tail = park and pending_bytes != 0 };
+}
+
+pub const IdlePostroll = struct {
+    remaining: ?usize = null,
+
+    pub fn reset(self: *IdlePostroll) void {
+        self.remaining = null;
+    }
+
+    /// Let the already cleared ring emit the same bounded postroll as Drain
+    /// before stopping DMA. New PCM cancels this pending idle transition.
+    pub fn observe(self: *IdlePostroll, empty: bool, elapsed_periods: usize, postroll_periods: usize) bool {
+        if (!empty) {
+            self.reset();
+            return false;
+        }
+        self.remaining = if (self.remaining) |remaining| remaining -| elapsed_periods else postroll_periods;
+        return self.remaining.? == 0;
+    }
 };
 
 pub const PeriodBook = struct {
@@ -112,7 +143,10 @@ pub const PeriodBook = struct {
             }
             cursor = (cursor + 1) % self.count;
             result.periods += 1;
-            if (!self.ready[cursor]) result.missing += 1;
+            if (!self.ready[cursor]) {
+                result.missing += 1;
+                if (self.queued != 0) result.starved += 1;
+            }
         }
         self.current = current;
         if (result.missing != 0) self.producer = (current + 1) % self.count;
@@ -231,4 +265,41 @@ test "period book reports a wraparound gap instead of replaying stale data" {
     try std.testing.expectEqual(@as(usize, 4), book.expireWindow(0));
     try std.testing.expectEqual(@as(usize, 0), book.queued);
     try std.testing.expectEqual(@as(usize, 1), book.nextWritable().?);
+}
+
+test "exhaustion parks while prepared-data gaps remain real underruns" {
+    const std = @import("std");
+    var book = PeriodBook.init(4);
+    try std.testing.expect(book.commit(0));
+    try std.testing.expect(book.commit(1));
+    try std.testing.expect(book.start(0));
+    const exhausted = book.advance(3);
+    try std.testing.expectEqual(Completion{ .park = true }, afterAdvance(exhausted, book.queued, 0, 1920, false));
+    try std.testing.expectEqual(Completion{ .park = true, .tail = true }, afterAdvance(exhausted, book.queued, 400, 1920, false));
+    try std.testing.expectEqual(Completion{ .underruns = 2 }, afterAdvance(exhausted, book.queued, 1920, 1920, false));
+    try std.testing.expectEqual(Completion{}, afterAdvance(exhausted, book.queued, 0, 1920, true));
+    book.reset();
+    try std.testing.expect(book.commit(0));
+    try std.testing.expect(book.commit(2));
+    try std.testing.expect(book.start(0));
+    const gap_then_end = book.advance(3);
+    try std.testing.expectEqual(Completion{ .underruns = 1, .park = true }, afterAdvance(gap_then_end, book.queued, 0, 1920, false));
+    book.reset();
+    try std.testing.expect(book.commit(0));
+    try std.testing.expect(book.start(0));
+    try std.testing.expectEqual(@as(usize, 0), book.current);
+}
+
+test "idle stop waits for codec postroll and new PCM cancels it" {
+    const std = @import("std");
+    var postroll: IdlePostroll = .{};
+    try std.testing.expect(!postroll.observe(true, 1, 3));
+    try std.testing.expect(!postroll.observe(true, 2, 3));
+    try std.testing.expect(!postroll.observe(false, 1, 3));
+    try std.testing.expect(!postroll.observe(true, 1, 3));
+    try std.testing.expect(!postroll.observe(true, 1, 3));
+    try std.testing.expect(postroll.observe(true, 2, 3));
+    postroll.reset();
+    try std.testing.expect(!postroll.observe(true, 8, 3));
+    try std.testing.expect(postroll.observe(true, 8, 3));
 }
