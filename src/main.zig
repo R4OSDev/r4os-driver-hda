@@ -414,6 +414,7 @@ const State = struct {
     pcm_queue: stream_ring.ByteQueue = .{},
     playback_started: bool = false,
     draining: bool = false,
+    start_due_tick: u64 = 0,
     underrun_active: bool = false,
     reset_stream_count: u64 = 0,
     dma_fail_count: u64 = 0,
@@ -1866,9 +1867,11 @@ fn refillWork(raw_context: usize) callconv(.c) i32 {
     const ctx = r4os.r4dev.DriverContext.init(s.api);
     releaseCompletedWork(state, &ctx, .worker);
     const observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
+    var completed = false;
     if (!@atomicLoad(bool, &s.shutting_down, .acquire)) {
         if (tryAcquireStream(state)) {
             defer releaseStream(state);
+            completed = true;
             const status_bits = s.recovery_latch.take();
             if (status_bits != 0) {
                 const reason: [*:0]const u8 = if ((status_bits & SD_STS_DESE) != 0 and (status_bits & SD_STS_FIFOE) != 0)
@@ -1887,7 +1890,7 @@ fn refillWork(raw_context: usize) callconv(.c) i32 {
             }
         }
     }
-    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down) == .resubmit) scheduleRefillWork(s);
+    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, completed) == .resubmit) scheduleRefillWork(s);
     return 0;
 }
 
@@ -2172,6 +2175,8 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     state.converted_frame_count +%= state.last_output_bytes / pcm.TARGET_FRAME_BYTES;
     state.write_count += 1;
     state.last_pcm_tick = ctx.tickCount();
+    if (!state.playback_started and state.start_due_tick == 0)
+        state.start_due_tick = state.last_pcm_tick +| msTicks(&ctx, 10);
     fillDmaPeriods(state, &ctx);
     startPlaybackIfNeeded(state);
     return finishWrite(state, 0, write_start);
@@ -2206,13 +2211,18 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
     // delayed or coalesced under TCG, so refresh ownership directly from
     // LPIB before publishing the ring fill. Never wait behind an active
     // writer; the next status or IRQ job will observe the position instead.
-    if (@atomicLoad(bool, &state.present, .acquire) and state.dma_ready and tryAcquireStream(state)) {
-        var ctx = context(state);
-        pollJackAndSwitch(state, &ctx);
-        refreshPlaybackPosition(state, &ctx);
-        fillDmaPeriods(state, &ctx);
-        startPlaybackIfNeeded(state);
-        releaseStream(state);
+    var deferred = false;
+    if (@atomicLoad(bool, &state.present, .acquire) and state.dma_ready) {
+        if (!tryAcquireStream(state)) {
+            deferred = true;
+        } else {
+            var ctx = context(state);
+            pollJackAndSwitch(state, &ctx);
+            refreshPlaybackPosition(state, &ctx);
+            fillDmaPeriods(state, &ctx);
+            startPlaybackIfNeeded(state);
+            releaseStream(state);
+        }
     }
     out.* = .{
         .active = if (@atomicLoad(bool, &state.present, .acquire) and state.backend_registered and state.dma_ready and state.output_path_ok) 1 else 0,
@@ -2233,7 +2243,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
         .max_refill_ticks = state.refill_max_ticks,
         .total_refill_ticks = state.refill_total_ticks,
     };
-    return 0;
+    return if (deferred) r4os.abi.service_api_result_busy else 0;
 }
 
 fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
@@ -2248,17 +2258,16 @@ fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
         state.refill_count +%= 1;
         recordTickStat(state, &state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
     }
-    // A short final write after an already parked ring has no completion IRQ.
-    // Existing active-session status observation can flush it once a whole
-    // period has elapsed; adjacent producer fragments still combine normally.
-    if (state.idle_parked and !state.accepting_pcm and !state.draining and state.periods.queued == 0 and
-        state.pcm_queue.used > 0 and state.pcm_queue.used < DMA_BUFFER_BYTES and
-        ctx.tickCount() -| state.last_pcm_tick >= msTicks(ctx, 10))
+    // Both a first short tone and a parked stream lack a completion IRQ.
+    // The core's delayed progress callback supplies this observation. Adjacent
+    // writes may combine, but never postpone the first pending start deadline.
+    if (!state.playback_started and !state.accepting_pcm and !state.draining and
+        state.start_due_tick != 0 and ctx.tickCount() >= state.start_due_tick)
     {
-        if (commitTailPeriod(state)) {
-            state.tail_start_pending = true;
+        if (state.pcm_queue.used > 0 and state.pcm_queue.used < DMA_BUFFER_BYTES and commitTailPeriod(state)) {
             state.idle_tail_count +%= 1;
         }
+        if (state.periods.queued != 0) state.tail_start_pending = true;
     }
 }
 
@@ -2481,6 +2490,7 @@ fn startPlaybackIfNeeded(state: *State) void {
     if (state.idle_parked) state.idle_resume_count +%= 1;
     state.idle_parked = false;
     state.tail_start_pending = false;
+    state.start_due_tick = 0;
     state.start_count += 1;
     updateStreamStatus(state);
 }
@@ -2526,6 +2536,7 @@ fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool
         state.resampler_state.reset();
         state.idle_parked = false;
         state.tail_start_pending = false;
+        state.start_due_tick = 0;
         state.draining = false;
         state.stop_count += 1;
         return true;
@@ -2559,6 +2570,7 @@ fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool
     state.resampler_state.reset();
     state.idle_parked = false;
     state.tail_start_pending = false;
+    state.start_due_tick = 0;
     state.stop_count += 1;
     updateStreamStatus(state);
     return true;
@@ -2571,6 +2583,7 @@ fn recoverStream(state: *State, ctx: *const r4os.r4dev.DriverContext, reason: [*
     state.playback_started = false;
     state.idle_parked = false;
     state.tail_start_pending = false;
+    state.start_due_tick = 0;
     resetPositionTracking(state);
     state.dropped_frame_count +%= state.pcm_queue.used / pcm.TARGET_FRAME_BYTES;
     state.dropped_frame_count +%= state.periods.queued * (DMA_BUFFER_BYTES / pcm.TARGET_FRAME_BYTES);
