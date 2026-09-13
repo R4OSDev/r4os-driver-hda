@@ -26,6 +26,14 @@ pub const Sink = struct {
     port_id: [8]u8 = .{0} ** 8,
     display_port: bool = false,
     baseline_bytes: u16 = 0,
+    eld_fingerprint: u64 = 0,
+    display_source: u64 = 0,
+    display_receiver_sequence: u64 = 0,
+    display_revision: u64 = 0,
+    display_adapter: u32 = 0,
+    display_connector: u32 = 0,
+    display_head: u32 = 0,
+    display_device_entry: u32 = 0,
 };
 
 pub fn isDisplayPin(widget_caps: u32, pin_caps: u32) bool {
@@ -50,6 +58,7 @@ pub fn inspect(sense: u32, eld: []const u8) Sink {
     if (total < 20 or total > eld.len or name_len > 16 or
         20 + name_len + sad_count * 3 > total or connection > 1) return result;
     result.baseline_bytes = @intCast(total);
+    result.eld_fingerprint = std.hash.Wyhash.hash(0, eld[0..total]);
     result.display_port = connection == 1;
     @memcpy(&result.port_id, eld[8..16]);
     for (eld[20 .. 20 + name_len], 0..) |c, i| result.name[i] = if (c >= 32 and c < 127) c else '?';
@@ -60,14 +69,52 @@ pub fn inspect(sense: u32, eld: []const u8) Sink {
     if (result.display_port) return result;
     for (0..sad_count) |i| {
         const sad = eld[20 + name_len + 3 * i ..][0..3];
+        const format = (sad[0] >> 3) & 15;
+        if (sad[0] & 128 != 0 or format == 0 or sad[1] == 0 or sad[1] & 128 != 0 or
+            (format == 1 and (sad[2] & 7 == 0 or sad[2] & 0xf8 != 0))) {
+            result.availability = .invalid_eld;
+            return result;
+        }
         if (((sad[0] >> 3) & 15) == 1 and (sad[0] & 7) >= 1 and
             (sad[1] & 4) != 0 and (sad[2] & 1) != 0)
         {
             result.availability = .ready;
-            break;
         }
     }
     return result;
+}
+
+/// Hardware bytes must match the exact display-owner publication. This
+/// never treats a GPU head as an HDA NID, nor a monitor name as an identity.
+pub fn associate(sink: Sink, bytes: []const u8, route: anytype, ready: bool) Sink {
+    var result = sink;
+    if (!ready or route.source.generation == 0 or route.receiver_sequence == 0 or route.revision == 0 or
+        route.eld_bytes != bytes.len or bytes.len > route.eld.len or
+        !std.mem.eql(u8, &route.port_id, &sink.port_id) or !std.mem.eql(u8, bytes, route.eld[0..bytes.len])) {
+        result.availability = .waiting_for_eld;
+        return result;
+    }
+    result.display_source = route.source.generation;
+    result.display_receiver_sequence = route.receiver_sequence;
+    result.display_revision = route.revision;
+    result.display_adapter = route.source.adapter_id;
+    result.display_connector = route.connector_id;
+    result.display_head = route.head_id;
+    result.display_device_entry = route.device_entry;
+    return result;
+}
+
+pub fn sameReceiver(left: Sink, right: Sink) bool {
+    return left.availability == right.availability and left.eld_fingerprint == right.eld_fingerprint and
+        std.mem.eql(u8, &left.port_id, &right.port_id) and left.display_source == right.display_source and
+        left.display_receiver_sequence == right.display_receiver_sequence and left.display_revision == right.display_revision and
+        left.display_adapter == right.display_adapter and left.display_connector == right.display_connector and
+        left.display_head == right.display_head and left.display_device_entry == right.display_device_entry;
+}
+pub fn sameDisplayPort(left: Sink, right: Sink) bool {
+    return left.display_source != 0 and left.display_connector != 0 and
+        left.display_source == right.display_source and left.display_adapter == right.display_adapter and
+        left.display_connector == right.display_connector and std.mem.eql(u8, &left.port_id, &right.port_id);
 }
 
 /// Stereo, front-left/front-right; frequency and sample size refer to the
@@ -109,6 +156,26 @@ test "HDMI sink requires complete ELD and exact stereo PCM capabilities" {
     try std.testing.expectEqual(Availability.unsupported, inspect(present, &eld).availability);
     eld[4] = 31;
     try std.testing.expectEqual(Availability.invalid_eld, inspect(present, &eld).availability);
+    eld[4] = 4; eld[5] = 2 << 4; eld[2] = 7;
+    @memcpy(eld[27..30], &[_]u8{ 0x89, 4, 1 }); // Invalid later SAD must not hide behind the first supported one.
+    try std.testing.expectEqual(Availability.invalid_eld, inspect(present, &eld).availability);
+    eld[5] = 1 << 4; @memset(eld[27..30], 0);
+    const plain = inspect(present, &eld);
+    var route = struct {
+        source: struct { generation: u64 = 8, adapter_id: u32 = 9 } = .{},
+        receiver_sequence: u64 = 2, revision: u64 = 3, connector_id: u32 = 4,
+        head_id: u32 = 2, device_entry: u32 = 0, eld_bytes: u32 = 32,
+        port_id: [8]u8 = @splat(0), eld: [32]u8,
+    }{ .eld = eld };
+    const bound = associate(plain, &eld, route, true);
+    try std.testing.expect(bound.availability == .ready and bound.display_connector == 4 and bound.display_head == 2 and bound.display_device_entry == 0);
+    try std.testing.expect(!sameReceiver(plain, bound));
+    try std.testing.expect(associate(plain, &eld, route, false).availability == .waiting_for_eld);
+    route.revision += 1;
+    const newer = associate(plain, &eld, route, true);
+    try std.testing.expect(!sameReceiver(bound, newer) and sameDisplayPort(bound, newer));
+    route.eld[25] = 2;
+    try std.testing.expect(associate(plain, &eld, route, true).availability == .waiting_for_eld);
 }
 
 test "HDMI stereo infoframe carries stereo allocation and valid checksum" {

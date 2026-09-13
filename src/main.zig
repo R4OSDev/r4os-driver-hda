@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 const pcm = r4os.audio_pcm;
 const stream_ring = @import("stream_ring.zig");
@@ -321,6 +322,8 @@ const State = struct {
     output_count: usize = 0,
     active_output_index: i32 = -1,
     output_poll_tick: u64 = 0,
+    display_audio: ?r4os.driver_outputs.Context = null,
+    display_audio_managed: bool = false,
     explicit_output: bool = false,
     backend_registered: bool = false,
     present: bool = false,
@@ -480,6 +483,7 @@ const State = struct {
     irq_work_dropped: u64 = 0,
     irq_generation: u64 = 0,
     work_pending: bool = false,
+    synchronous_stop: bool = false,
     work_handles: [WORK_HANDLE_CAPACITY]u32 = .{0} ** WORK_HANDLE_CAPACITY,
     completion_reap_gate: irq_recovery.ReapGate = .{},
     stream_lock: bool = false,
@@ -558,6 +562,7 @@ fn initController(state: *State, api: *const r4os.r4dev.DriverApi, info: r4os.ab
         ctx.logError("HDA.R4D driver api mismatch");
         return -10;
     }
+    if (ctx.graphicsOutputs()) |outputs| if (outputs.supportsAudio()) { state.display_audio = outputs; };
 
     if (!initializeControllerCandidate(state, &ctx, info)) {
         ctx.logError("HDA.R4D controller initialization failed");
@@ -1207,6 +1212,12 @@ fn chooseOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext) vo
         }
     }
 
+    rejectAmbiguousDisplayPins(state);
+    state.output_routes[outputRouteIndex(.hdmi)] = .{};
+    for (state.output_catalog[0..state.output_count]) |candidate| if (candidate.role == .hdmi and candidate.sink.availability == .ready) {
+        state.output_routes[outputRouteIndex(.hdmi)] = candidate;
+        break;
+    };
     state.jack_sense = readHeadphoneSense(state, ctx);
     const role = codec_program.chooseActiveRole(
         state.output_routes[outputRouteIndex(.speaker)].found,
@@ -1230,6 +1241,15 @@ fn outputRouteIndex(role: codec_program.PinRole) usize {
 }
 
 fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8) hdmi.Sink {
+    const location = (@as(u32, state.info.bus_kind) << 24) | (@as(u32, state.info.bus) << 8) |
+        (@as(u32, state.info.device) << 3) | state.info.function;
+    const device = @as(u32, state.info.vendor_id) | (@as(u32, state.info.device_id) << 16);
+    if (state.display_audio) |outputs| {
+        var record: r4os.abi.GfxAudioRoute = .{};
+        const rc = outputs.queryAudio(location, device, 0, &record);
+        if (rc < 0) return .{ .availability = .waiting_for_eld };
+        if (rc == 1) state.display_audio_managed = true;
+    }
     const sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse return .{ .availability = .invalid_eld };
     if ((sense & (hdmi.sense_present | hdmi.sense_eld_valid)) != (hdmi.sense_present | hdmi.sense_eld_valid)) return hdmi.inspect(sense, &.{});
     const size = sendVerb(state, makeVerb(codec, pin, hdmi.get_eld_size, 8)) orelse return .{ .availability = .invalid_eld };
@@ -1243,7 +1263,21 @@ fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, 
         byte.* = @truncate(value);
     }
     const final_sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse return .{ .availability = .invalid_eld };
-    return hdmi.inspect(final_sense, bytes[0..size]);
+    var sink = hdmi.inspect(final_sense, bytes[0..size]);
+    if (!state.display_audio_managed or sink.availability != .ready) return sink;
+    const outputs = state.display_audio orelse return .{ .availability = .waiting_for_eld };
+    var index: u32 = 0;
+    while (index < r4os.abi.gfx_output_catalog_capacity) : (index += 1) {
+        var route: r4os.abi.GfxAudioRoute = .{};
+        if (outputs.queryAudio(location, device, index, &route) != 1) break;
+        if (!std.mem.eql(u8, &route.port_id, &sink.port_id)) continue;
+        sink = hdmi.associate(sink, bytes[0..size], route, route.state == r4os.abi.gfx_audio_route_ready);
+        var after: r4os.abi.GfxAudioRoute = .{};
+        if (outputs.queryAudio(location, device, index, &after) != 1 or !std.meta.eql(route, after)) sink.availability = .waiting_for_eld;
+        return sink;
+    }
+    sink.availability = .waiting_for_eld;
+    return sink;
 }
 
 fn logHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, sink: hdmi.Sink) void {
@@ -1358,13 +1392,18 @@ fn buildOutputPlan(state: *State, candidate: OutputCandidate) ?codec_program.Pro
 
 fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, candidate: OutputCandidate) bool {
     if (candidate.role == .hdmi) {
-        if (readHdmiSink(state, ctx, candidate.codec, candidate.pin).availability != .ready) return false;
+        const current = readHdmiSink(state, ctx, candidate.codec, candidate.pin);
+        if (current.availability != .ready or !hdmi.sameReceiver(current, candidate.sink)) return false;
         const packet_size = sendVerb(state, makeVerb(candidate.codec, candidate.pin, hdmi.get_eld_size, 0)) orelse return false;
         if (packet_size < hdmi.stereoInfoFrame().len) return false;
     }
     state.route_program_plan = buildOutputPlan(state, candidate) orelse return false;
     for (state.route_program_plan.slice()) |operation| {
         if (!executeOutputOperation(state, ctx, candidate.codec, operation)) return false;
+    }
+    if (candidate.role == .hdmi and !hdmi.sameReceiver(readHdmiSink(state, ctx, candidate.codec, candidate.pin), candidate.sink)) {
+        _ = deactivateOutputCandidate(state, candidate);
+        return false;
     }
     state.output = candidate;
     state.output_stream_id = FIRST_STREAM_ID;
@@ -1826,6 +1865,7 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
 }
 
 fn scheduleRefillWork(s: *State) void {
+    if (!work_gate.maySchedule(&s.shutting_down, &s.synchronous_stop)) return;
     if (@atomicRmw(bool, &s.work_pending, .Xchg, true, .acq_rel)) return;
     const ctx = r4os.r4dev.DriverContext.init(s.api);
     var free_index: ?usize = null;
@@ -1890,7 +1930,7 @@ fn refillWork(raw_context: usize) callconv(.c) i32 {
             }
         }
     }
-    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, completed) == .resubmit) scheduleRefillWork(s);
+    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, &s.synchronous_stop, completed) == .resubmit) scheduleRefillWork(s);
     return 0;
 }
 
@@ -2004,18 +2044,35 @@ fn refreshOutputs(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     const now = ctx.tickCount();
     if (now < state.output_poll_tick) return;
     state.output_poll_tick = now +| msTicks(ctx, JACK_POLL_MS);
-    for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| {
+    for (state.output_catalog[0..state.output_count]) |*candidate| {
         if (candidate.role != .hdmi) continue;
         const sink = readHdmiSink(state, ctx, candidate.codec, candidate.pin);
         if (sink.availability != candidate.sink.availability) logHdmiSink(state, ctx, candidate.codec, candidate.pin, sink);
         candidate.sink = sink;
-        if (@atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index)) and sink.availability != .ready) {
+    }
+    rejectAmbiguousDisplayPins(state);
+    const active = @atomicLoad(i32, &state.active_output_index, .acquire);
+    if (active >= 0 and active < state.output_count) {
+        const candidate = state.output_catalog[@intCast(active)];
+        if (candidate.role == .hdmi and (candidate.sink.availability != .ready or !hdmi.sameReceiver(candidate.sink, state.output.sink))) {
             _ = stopPlayback(state, ctx, false);
             _ = deactivateOutputCandidate(state, state.output);
             state.output_path_ok = false;
             @atomicStore(i32, &state.active_output_index, -1, .release);
         }
     }
+}
+fn rejectAmbiguousDisplayPins(state: *State) void {
+    var ambiguous: [32]bool = @splat(false);
+    for (state.output_catalog[0..state.output_count], 0..) |candidate, index| {
+        if (candidate.role != .hdmi or candidate.sink.availability != .ready) continue;
+        for (state.output_catalog[0..index], 0..) |previous, prior| {
+            if (previous.role == .hdmi and previous.sink.availability == .ready and hdmi.sameDisplayPort(previous.sink, candidate.sink)) {
+                ambiguous[prior] = true; ambiguous[index] = true;
+            }
+        }
+    }
+    for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| if (ambiguous[index]) { candidate.sink.availability = .invalid_eld; };
 }
 
 fn outputAvailability(candidate: OutputCandidate) u32 {
@@ -2532,6 +2589,12 @@ fn drainPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 
 fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
     if (!state.dma_ready or state.stream_desc_base == 0) return true;
+    // The stream owner advances DMA itself through Drain and descriptor reset.
+    // A contended deadline worker must not immediately resubmit while this
+    // owner sleeps: that loop can starve Close and its own drain deadline.
+    // IRQs still acknowledge/latch hardware state; pending work can finish.
+    @atomicStore(bool, &state.synchronous_stop, true, .release);
+    defer @atomicStore(bool, &state.synchronous_stop, false, .release);
     if (state.idle_parked and state.periods.queued == 0 and state.pcm_queue.used == 0) {
         state.resampler_state.reset();
         state.idle_parked = false;

@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.13
+﻿HDA.R4D 0.3.18
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -8,23 +8,32 @@ DMA-, Driver-Work- und Audio-Registrierungsmechanismen.
 
 Controller, Reset und Codecinventar
 -----------------------------------
-Der Treiber enumeriert alle begrenzt im kanonischen PCI-Inventar vorhandenen
-Funktionen der Klasse 04/03. Jeder Kandidat wird kontrolliert gequiesced,
-unabhaengig von einem Firmwarealtzustand ueber CRST zurueckgesetzt und erst
-nach dem zeitlich begrenzten STATESTS-Fenster untersucht. Reine HDMI-/Digital-
-Kandidaten verdraengen keinen spaeteren Controller mit analogem Speaker-,
-Kopfhoerer- oder Line-Out-Pin. Bei gleicher analoger Evidenz entscheidet die
-kanonische PCI-Inventarreihenfolge. Abgelehnte Kandidaten stoppen ihren
-Kommandotransport, geben CORB/RIRB-DMA frei und erhalten ihr urspruengliches
-PCI-Command-Wort zurueck; der ausgewaehlte Kandidat wird definiert neu
-initialisiert. Kandidat, Auswahl und Ablehnungszahl bleiben im Treiberlog
-sichtbar. Seit 0.3.12 behaelt der Treiber die begrenzte PCI-Identitaet und
-Probe-Evidenz aller Kandidaten und gibt Auswahl und Core unmittelbar neben
-jedem Close-Diagnoserecord erneut aus. AUDIOD kann dadurch auch nach vorherigen
-Audioanwendungen Vendor-/Device-ID, Transport, Discovery, analoge und digitale
-Pins sowie Routennachweis laufgebunden exportieren, bevor das begrenzte
-Logfenster weiterlaeuft.
+Bis zu vier PCI-Funktionen der Klasse 04/03 bleiben als unabhaengige
+Instanzen erhalten: Codecgraph, CORB/RIRB, PCM-/DMA-Ring, IRQ und Worker
+gehoeren jeweils ihrem Controller. Jeder Kandidat wird zeitlich begrenzt
+quiesced, ueber CRST zurueckgesetzt und nach STATESTS untersucht. Weitere
+Controller erzeugen eine Kapazitaetsmeldung. Fehlgeschlagene Instanzen
+stoppen DMA/IRQ und stellen ihr PCI-Command-Wort wieder her.
 
+Jeder Controller behaelt bis zu 32 physische Ausgaenge mit stabiler ID aus
+PCI-, Codec- und Pin-Identitaet. Digitalcontroller ohne Empfaenger bleiben
+sichtbar und verdraengen keine analogen Ausgaenge. Ein Wechsel verwendet
+die bestehenden Instanzen; im laufenden Audiopfad gibt es keine PCI-Suche.
+
+HDMI koppelt seit 0.3.18 physische PD/ELDV und vollstaendig gelesene ELD-
+Bytes an die aktuelle Displayquelle, Empfaengersequenz und Publikations-
+revision. Der ELD-Port ordnet den echten Pin dem Connector zu; Head und
+Device Entry werden nicht als Pin-NID interpretiert. Unklare doppelte
+Zuordnung sperrt die Pins. Neue Revision, Kabelverlust oder fehlende
+Freigabe stoppen die aktive alte Route. Wiederaufnahme verlangt erneute
+Pruefung vor und nach dem Codecplan. Ohne gebundene Displayquelle bleibt
+der vorhandene physische ELD-Pfad anderer Hardware verwendbar.
+
+Zulaessig ist vorerst 48-kHz-Stereo-S16LE mit Converterformat 0x0011,
+FL/FR-Slots und checksummiertem Audio-InfoFrame. GPU-Steuerung und ELD-
+Erzeugung gehoeren NVIDIA/R4GFX; der gemeinsame Kernel kopiert nur die
+Metadaten. Aktueller Vertrag: Docs/Drivers/HdaStreamContract.txt sowie
+GrafikAudio07915.txt/.json. Reale HDMI-Tonabnahme: OssiGPU.txt / 0.79.15.
 Seit 0.3.13 beschreibt der kompakte Close-Record nicht mehr nur, ob ein
 DMA-Positionspuffer eingerichtet wurde, sondern welche plausibilisierte
 Positionsquelle tatsaechlich aktiv blieb. `dma+lpib`, `lpib-transient`,
@@ -281,3 +290,12 @@ unangetastet. Ein damit erreichter Desktop grenzt den konfigurierten
 HDA-Ladepfad ein, ist jedoch weder Audio- noch Hardwareabnahme. Vor einem
 Quirk muessen ueber HWDIAG und einen engeren Probeaufbau die genaue
 PCI-Funktion und die fehlschlagende Initialisierungsstufe belegt werden.
+
+Synchroner Stop (0.3.18)
+-----------------------
+Drain und Descriptorreset uebernehmen den DMA-Fortschritt im Stream-Owner.
+Ein atomarer Stopzustand verhindert konkurrierende IRQ-Nachfolgearbeit;
+IRQs werden weiter quittiert und Fehler gelatcht. So kann ein am Stream-Lock
+scheiternder Worker Close nicht durch staendige Selbstanmeldung verdraengen.
+Der normale IRQ-Pfad wird nach Stop wieder freigegeben. Drain-Frist und
+erzwungener Fehlerabbau bleiben unveraendert.
