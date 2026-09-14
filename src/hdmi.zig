@@ -64,9 +64,6 @@ pub fn inspect(sense: u32, eld: []const u8) Sink {
     for (eld[20 .. 20 + name_len], 0..) |c, i| result.name[i] = if (c >= 32 and c < 127) c else '?';
     result.name_len = @intCast(name_len);
     result.availability = .unsupported;
-    // This implementation supplies the HDMI Audio InfoFrame. DP uses a
-    // different packet header and remains explicitly unavailable here.
-    if (result.display_port) return result;
     for (0..sad_count) |i| {
         const sad = eld[20 + name_len + 3 * i ..][0..3];
         const format = (sad[0] >> 3) & 15;
@@ -120,10 +117,20 @@ pub fn sameDisplayPort(left: Sink, right: Sink) bool {
 /// Stereo, front-left/front-right; frequency and sample size refer to the
 /// PCM stream. The checksum covers the three header and eleven body bytes.
 pub fn stereoInfoFrame() [14]u8 {
+    return stereoPacket(false, false);
+}
+/// HDA's DIP buffer carries the transport header. NVIDIA display codecs
+/// retain a checksum byte in DP mode; the standard DP layout has none.
+/// Fixed-size zero padding clears bytes left by a previous HDMI receiver.
+pub fn stereoPacket(display_port: bool, nvidia_layout: bool) [14]u8 {
     var bytes = [_]u8{0} ** 14;
     bytes[0] = 0x84;
-    bytes[1] = 1;
-    bytes[2] = 10;
+    bytes[1] = if (display_port) 0x1b else 1;
+    bytes[2] = if (display_port) 0x44 else 10;
+    if (display_port and !nvidia_layout) {
+        bytes[3] = 1;
+        return bytes;
+    }
     bytes[4] = 1; // channel count minus one
     var sum: u8 = 0;
     for (bytes) |b| sum +%= b;
@@ -152,8 +159,16 @@ test "HDMI sink requires complete ELD and exact stereo PCM capabilities" {
     eld[26] = 4; // 24-bit only
     try std.testing.expectEqual(Availability.unsupported, inspect(present, &eld).availability);
     eld[26] = 1;
-    eld[5] |= 4; // DisplayPort packet format is not HDMI.
-    try std.testing.expectEqual(Availability.unsupported, inspect(present, &eld).availability);
+    eld[5] |= 4; // DP uses the same SAD/ELD association, a different DIP header.
+    const dp = inspect(present, &eld);
+    try std.testing.expect(dp.availability == .ready and dp.display_port);
+    const packet = stereoPacket(true, false);
+    try std.testing.expectEqualSlices(u8, &.{0x84,0x1b,0x44,1,0}, packet[0..5]);
+    const nv_packet = stereoPacket(true, true);
+    try std.testing.expectEqualSlices(u8, &.{0x84,0x1b,0x44,0x1c,1}, nv_packet[0..5]);
+    eld[5] |= 8;
+    try std.testing.expectEqual(Availability.invalid_eld, inspect(present, &eld).availability);
+    eld[5] &= ~@as(u8, 8);
     eld[4] = 31;
     try std.testing.expectEqual(Availability.invalid_eld, inspect(present, &eld).availability);
     eld[4] = 4; eld[5] = 2 << 4; eld[2] = 7;

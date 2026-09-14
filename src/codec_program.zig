@@ -152,6 +152,8 @@ pub const PlanInput = struct {
     afg_power_caps: u32 = 0,
     pin_caps: u32 = 0,
     pin_role: PinRole = .line_out,
+    display_port: bool = false,
+    nvidia_dp_layout: bool = false,
     pcm_caps: u32 = 0,
     stream_caps: u32 = 0,
     route_count: u8 = 0,
@@ -211,6 +213,8 @@ pub fn buildPlan(input: *const PlanInput) ?ProgramPlan {
     if (converter.node == 0 or converter.kind != widget_audio_output) return null;
     if (!supportsOutputFormat(converter.widget_caps, input.pcm_caps, input.stream_caps, input.pin_role == .hdmi)) return null;
     if (input.pin_role == .hdmi and !hdmi.isDisplayPin(pin.widget_caps, input.pin_caps)) return null;
+    if (input.display_port and (input.pin_role != .hdmi or input.pin_caps & hdmi.pin_cap_dp == 0)) return null;
+    if (input.pin_role == .hdmi and !input.display_port and input.pin_caps & hdmi.pin_cap_hdmi == 0) return null;
     if (input.afg_power_caps != 0 and (input.afg_power_caps & 1) == 0) return null;
 
     var plan = ProgramPlan{};
@@ -277,7 +281,7 @@ pub fn buildPlan(input: *const PlanInput) ?ProgramPlan {
         if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
             !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node }) or
             !plan.append(.{ .kind = .set_dip_index, .node = pin.node })) return null;
-        for (hdmi.stereoInfoFrame()) |byte| {
+        for (hdmi.stereoPacket(input.display_port, input.nvidia_dp_layout)) |byte| {
             if (!plan.append(.{ .kind = .set_dip_byte, .node = pin.node, .value = byte })) return null;
         }
         if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
@@ -329,6 +333,21 @@ test "HDMI route sets digital PCM stereo mapping and complete infoframe before s
         else => {},
     };
     try std.testing.expectEqualSlices(u8, &hdmi.stereoInfoFrame(), &packet);
+    input.display_port = true;
+    try std.testing.expect(buildPlan(&input) == null); // HDMI-only pin cannot carry DP.
+    input.pin_caps = pin_cap_output | hdmi.pin_cap_dp;
+    for ([_]bool{ false, true }) |nvidia| {
+        input.nvidia_dp_layout = nvidia;
+        const dp_plan = buildPlan(&input).?;
+        bytes = 0; transmitter_on = false;
+        for (dp_plan.slice()) |op| switch (op.kind) {
+            .set_dip_byte => { packet[bytes] = @intCast(op.value); bytes += 1; },
+            .set_dip_xmit => if (op.value != 0) { try std.testing.expect(bytes == packet.len); transmitter_on = true; },
+            .set_stream => try std.testing.expect(transmitter_on),
+            else => {},
+        };
+        try std.testing.expectEqualSlices(u8, &hdmi.stereoPacket(true, nvidia), &packet);
+    }
     input.route[1].widget_caps &= ~widget_cap_digital;
     try std.testing.expect(buildPlan(&input) == null);
 }

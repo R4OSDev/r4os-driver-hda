@@ -1367,6 +1367,8 @@ fn buildOutputPlan(state: *State, candidate: OutputCandidate) ?codec_program.Pro
         .afg_power_caps = afg.power_caps,
         .pin_caps = candidate.pin_caps,
         .pin_role = candidate.role,
+        .display_port = candidate.sink.display_port,
+        .nvidia_dp_layout = info.vendor_id >> 16 == 0x10de,
         .pcm_caps = candidate.pcm_caps,
         .stream_caps = candidate.stream_caps,
         .route_count = @intCast(route_count),
