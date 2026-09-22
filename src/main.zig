@@ -13,6 +13,7 @@ const stream_hardware = @import("stream_hardware.zig");
 const irq_recovery = @import("irq_recovery.zig");
 const lifecycle = @import("lifecycle.zig");
 const hdmi = @import("hdmi.zig");
+const amd_hdmi = @import("amd_hdmi.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("hda_init", "hda_shutdown"));
@@ -1252,6 +1253,10 @@ fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, 
     }
     const sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse return .{ .availability = .invalid_eld };
     if ((sense & (hdmi.sense_present | hdmi.sense_eld_valid)) != (hdmi.sense_present | hdmi.sense_eld_valid)) return hdmi.inspect(sense, &.{});
+    if (state.info.vendor_id == 0x1002 and state.info.device_id == 0x15de) {
+        if (!amdDisplayCodec(state, codec)) return .{ .availability = .unsupported };
+        return readAmdSink(state, ctx, codec, pin, location, device);
+    }
     const size = sendVerb(state, makeVerb(codec, pin, hdmi.get_eld_size, 8)) orelse return .{ .availability = .invalid_eld };
     if (size < 20 or size > hdmi.max_eld_bytes) return .{ .availability = .invalid_eld };
     var bytes: [hdmi.max_eld_bytes]u8 = undefined;
@@ -1278,6 +1283,40 @@ fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, 
     }
     sink.availability = .waiting_for_eld;
     return sink;
+}
+
+fn amdDisplayCodec(state: *const State, codec: u8) bool {
+    return state.info.vendor_id == 0x1002 and state.info.device_id == 0x15de and codec < state.codecs.len and
+        amd_hdmi.supported(state.codecs[codec].vendor_id, state.codecs[codec].revision_id);
+}
+const AmdSinkReader = struct {
+    state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, deadline: u64,
+    pub fn verb(self: *const @This(), command: u16, value: u8) ?u32 {
+        if (self.ctx.tickCount() >= self.deadline) return null;
+        return sendVerb(self.state, makeVerb(self.codec, self.pin, command, value));
+    }
+};
+fn readAmdSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, location: u32, device: u32) hdmi.Sink {
+    const outputs = state.display_audio orelse return .{ .availability = .waiting_for_eld };
+    // AMD has no standard ELD byte reader. Never trust firmware-only pin
+    // presence without this exact driver/source generation and vendor readback.
+    state.display_audio_managed = true;
+    const reader = AmdSinkReader{ .state = state, .ctx = ctx, .codec = codec, .pin = pin,
+        .deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS) };
+    for (0..r4os.abi.gfx_output_catalog_capacity) |i| {
+        var route: r4os.abi.GfxAudioRoute = .{};
+        if (outputs.queryAudio(location, device, @intCast(i), &route) != 1) break;
+        if (route.state != r4os.abi.gfx_audio_route_ready or route.eld_bytes > route.eld.len) continue;
+        if (!amd_hdmi.verify(&reader, route.eld[0..route.eld_bytes])) continue;
+        const sense = reader.verb(VERB_GET_PIN_SENSE, 0) orelse return .{ .availability = .invalid_eld };
+        var sink = hdmi.inspect(sense, route.eld[0..route.eld_bytes]);
+        if (sink.availability != .ready) return sink;
+        sink = hdmi.associate(sink, route.eld[0..route.eld_bytes], route, true);
+        var after: r4os.abi.GfxAudioRoute = .{};
+        if (outputs.queryAudio(location, device, @intCast(i), &after) != 1 or !std.meta.eql(route, after)) sink.availability = .waiting_for_eld;
+        return sink;
+    }
+    return .{ .availability = .waiting_for_eld };
 }
 
 fn logHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, sink: hdmi.Sink) void {
@@ -1369,6 +1408,7 @@ fn buildOutputPlan(state: *State, candidate: OutputCandidate) ?codec_program.Pro
         .pin_role = candidate.role,
         .display_port = candidate.sink.display_port,
         .nvidia_dp_layout = info.vendor_id >> 16 == 0x10de,
+        .amd_hdmi_rev3 = amdDisplayCodec(state, candidate.codec),
         .pcm_caps = candidate.pcm_caps,
         .stream_caps = candidate.stream_caps,
         .route_count = @intCast(route_count),
@@ -1396,8 +1436,10 @@ fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, c
     if (candidate.role == .hdmi) {
         const current = readHdmiSink(state, ctx, candidate.codec, candidate.pin);
         if (current.availability != .ready or !hdmi.sameReceiver(current, candidate.sink)) return false;
-        const packet_size = sendVerb(state, makeVerb(candidate.codec, candidate.pin, hdmi.get_eld_size, 0)) orelse return false;
-        if (packet_size < hdmi.stereoInfoFrame().len) return false;
+        if (!amdDisplayCodec(state, candidate.codec)) {
+            const packet_size = sendVerb(state, makeVerb(candidate.codec, candidate.pin, hdmi.get_eld_size, 0)) orelse return false;
+            if (packet_size < hdmi.stereoInfoFrame().len) return false;
+        }
     }
     state.route_program_plan = buildOutputPlan(state, candidate) orelse return false;
     for (state.route_program_plan.slice()) |operation| {
@@ -1452,6 +1494,18 @@ fn executeOutputOperation(state: *State, ctx: *const r4os.r4dev.DriverContext, c
         .set_eapd => sendVerb(state, makeVerb(codec, operation.node, VERB_SET_EAPD, @truncate(operation.value))) != null,
         .set_digital => sendVerb(state, makeVerb(codec, operation.node, 0x70d, @truncate(operation.value))) != null,
         .set_channel_count => sendVerb(state, makeVerb(codec, operation.node, 0x72d, @truncate(operation.value))) != null,
+        .set_amd_allocation, .set_amd_downmix, .set_amd_remap, .set_amd_ramp, .set_amd_slot, .clear_amd_hbr => blk: {
+            const reader = AmdSinkReader{ .state = state, .ctx = ctx, .codec = codec, .pin = operation.node,
+                .deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS) };
+            if (operation.kind == .clear_amd_hbr) break :blk amd_hdmi.pcmMode(&reader);
+            const verb: u16 = switch (operation.kind) {
+                .set_amd_allocation => amd_hdmi.set_allocation, .set_amd_downmix => amd_hdmi.set_downmix,
+                .set_amd_remap => amd_hdmi.set_remap, .set_amd_ramp => amd_hdmi.set_ramp,
+                .set_amd_slot => amd_hdmi.slotVerb(@intCast(operation.value)), else => unreachable,
+            };
+            const value: u8 = if (operation.kind == .set_amd_slot) amd_hdmi.slotValue(@intCast(operation.value), true) else @truncate(operation.value);
+            break :blk amd_hdmi.program(&reader, verb, value);
+        },
         .set_hdmi_slot => sendVerb(state, makeVerb(codec, operation.node, 0x734, @truncate(operation.value))) != null,
         .set_dip_index => sendVerb(state, makeVerb(codec, operation.node, 0x730, @truncate(operation.value))) != null,
         .set_dip_byte => sendVerb(state, makeVerb(codec, operation.node, 0x731, @truncate(operation.value))) != null,
@@ -1474,8 +1528,12 @@ fn deactivateOutputCandidate(state: *State, candidate: OutputCandidate) bool {
     if (!candidate.found) return true;
     var digital_stopped = true;
     if (candidate.role == .hdmi) {
-        digital_stopped = sendVerb(state, makeVerb(candidate.codec, candidate.pin, 0x730, 0)) != null;
-        digital_stopped = (sendVerb(state, makeVerb(candidate.codec, candidate.pin, 0x732, 0)) != null) and digital_stopped;
+        if (amdDisplayCodec(state, candidate.codec)) {
+            for (0..8) |slot| digital_stopped = (sendVerb(state, makeVerb(candidate.codec, candidate.pin, amd_hdmi.slotVerb(@intCast(slot)), 0)) != null) and digital_stopped;
+        } else {
+            digital_stopped = sendVerb(state, makeVerb(candidate.codec, candidate.pin, 0x730, 0)) != null;
+            digital_stopped = (sendVerb(state, makeVerb(candidate.codec, candidate.pin, 0x732, 0)) != null) and digital_stopped;
+        }
         digital_stopped = (sendVerb(state, makeVerb(candidate.codec, candidate.converter, 0x70d, 0)) != null) and digital_stopped;
     }
     const converter_stopped = setConverterStreamChannel(state, candidate.codec, candidate.converter, 0, 0);
@@ -3406,6 +3464,12 @@ fn operationName(kind: codec_program.OperationKind) []const u8 {
         .set_stream => "stream",
         .set_digital => "digital",
         .set_channel_count => "channels",
+        .set_amd_allocation => "set_amd_allocation",
+        .set_amd_downmix => "set_amd_downmix",
+        .set_amd_remap => "set_amd_remap",
+        .set_amd_ramp => "set_amd_ramp",
+        .set_amd_slot => "set_amd_slot",
+        .clear_amd_hbr => "clear_amd_hbr",
         .set_hdmi_slot => "slot",
         .set_dip_index => "dip-index",
         .set_dip_byte => "dip-byte",

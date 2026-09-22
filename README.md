@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.13`
+- Version: `0.3.20`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,7 +12,7 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA 0.3.13 enumerates every bounded PCI class-04/03 candidate and selects a
+HDA enumerates every bounded PCI class-04/03 candidate and selects a
 complete analog-capable controller from codec evidence instead of accepting
 the first function. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
@@ -128,3 +128,21 @@ acceptance and must be followed by an identity- and stage-bound HDA probe.
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+
+## AMD HDMI audio (0.80.22)
+
+The 1002:15DE display controller accepts only the verified 1002:AA01 codec
+revision 3 or later. Its vendor protocol replaces the standard ELD-RAM/DIP
+path: Presence/ELDV, manufacturer/product, name, PortID, PCM descriptor and
+lip sync must match the current copied AMDGPU route. A second route snapshot
+rejects replacement during the read. Codec NIDs, AZ endpoints and display
+heads are separate identities; ambiguous pin matches remain unavailable.
+
+The bounded programming plan confirms stereo channel allocation, independent
+slot remapping, 48 kHz S16 PCM, HBR off and converter ramp through vendor GET
+verbs. Standard HDMI/DP and analog codec paths retain their existing plans.
+Receiver revision changes stop stale streams; the shared AUDSVC policy owns
+selection, master gain, mute and reopening. The known Lenovo analog path
+1022:15E3 / 10EC:0257 is unchanged. No AMD audible hardware acceptance has
+been performed in this milestone; that belongs to 0.80.39.

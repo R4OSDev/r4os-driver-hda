@@ -139,6 +139,7 @@ pub fn stereoPacket(display_port: bool, nvidia_layout: bool) [14]u8 {
 }
 
 test "HDMI sink requires complete ELD and exact stereo PCM capabilities" {
+    try amdCodecCheck();
     const present = sense_present | sense_eld_valid;
     var eld = [_]u8{0} ** 32;
     eld[0] = 2 << 3;
@@ -200,4 +201,53 @@ test "HDMI stereo infoframe carries stereo allocation and valid checksum" {
     var sum: u8 = 0;
     for (bytes) |b| sum +%= b;
     try std.testing.expectEqual(@as(u8, 0), sum);
+}
+
+fn amdCodecCheck() !void {
+    const amd = @import("amd_hdmi.zig");
+    const Codec = struct {
+        fields: [9]u32 = .{ 0x4c2d, 0x3020, 4, 0x04030201, 0x08070605, 'T', 'O', 'N', '1' },
+        index: u8 = 0, fail: bool = false, stale: bool = false,
+        speaker: u32 = 0x101, descriptor: u32 = 0x04010409, latency: u32 = 0x106,
+        descriptor_selected: bool = false, programmed: u8 = 0, hbr: u8 = 0x11,
+        pub fn verb(self: *@This(), command: u16, value: u8) ?u32 {
+            if (self.fail) return null;
+            return switch (command) {
+                0xf70 => self.speaker,
+                0x780 => blk: { self.index = value; break :blk 0; },
+                0xf81 => if (self.index < self.fields.len) self.fields[self.index] else null,
+                0x776 => blk: { self.descriptor_selected = value == 8; break :blk 0; },
+                0xf76 => if (self.descriptor_selected) self.descriptor else null,
+                0xf7b => self.latency,
+                0x789 => blk: { if (!self.stale) self.programmed = value; break :blk 0; },
+                0xf89 => self.programmed,
+                0x77c => blk: { if (!self.stale) self.hbr = value; break :blk 0; },
+                0xf7c => self.hbr,
+                else => null,
+            };
+        }
+    };
+    var codec: Codec = .{};
+    // Literal vendor fixture with a distinct physical PortID; no producer code.
+    const bytes = [_]u8{16,0,6,0,4,16,5,1,1,2,3,4,5,6,7,8,0x2d,0x4c,0x20,0x30,'T','O','N','1',9,4,1,0};
+    try std.testing.expect(amd.supported(0x1002aa01, 0x100300) and !amd.supported(0x1002aa01, 0x100200) and !amd.supported(0x10ec0257, 0x100300));
+    try std.testing.expect(amd.verify(&codec, &bytes));
+    for (0..codec.fields.len) |i| {
+        codec.fields[i] ^= 1; try std.testing.expect(!amd.verify(&codec, &bytes)); codec.fields[i] ^= 1;
+    }
+    codec.speaker = 0x201; try std.testing.expect(!amd.verify(&codec, &bytes)); codec.speaker = 0x101;
+    codec.descriptor ^= 0x04000000; try std.testing.expect(!amd.verify(&codec, &bytes)); codec.descriptor ^= 0x04000000;
+    codec.latency += 1; try std.testing.expect(!amd.verify(&codec, &bytes)); codec.latency -= 1;
+    codec.fail = true; try std.testing.expect(!amd.verify(&codec, &bytes)); codec.fail = false;
+    try std.testing.expect(!amd.verify(&codec, bytes[0..27]));
+    try std.testing.expect(amd.program(&codec, 0x789, 1) and amd.pcmMode(&codec) and codec.hbr == 1);
+    codec.stale = true; codec.programmed = 0; codec.hbr = 0x11;
+    try std.testing.expect(!amd.program(&codec, 0x789, 1) and !amd.pcmMode(&codec));
+    const verbs = [_]u16{0x777,0x785,0x778,0x786,0x779,0x787,0x77a,0x788};
+    const values = [_]u8{1,0x11,0,0,0,0,0,0};
+    for (verbs, values, 0..) |verb, value, i| {
+        try std.testing.expectEqual(verb, amd.slotVerb(@intCast(i)));
+        try std.testing.expectEqual(value, amd.slotValue(@intCast(i), true));
+        try std.testing.expectEqual(@as(u8, 0), amd.slotValue(@intCast(i), false));
+    }
 }

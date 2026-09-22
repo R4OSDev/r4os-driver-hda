@@ -11,3 +11,13 @@ Transfer in R4OS 0.64.18:
 - Nur Paketpin, Buildstarter, Settings und Repositoryhygiene wurden an die
   neue Mehrrepo-Struktur angepasst; die Treiberimplementierung blieb
   unveraendert.
+
+
+0.80.22 / HDA 0.3.20:
+- Eigenstaendige AMD-Rev3-Protokollpruefung in src/amd_hdmi.zig und Integration
+  in den bestehenden HDA-Routenbesitzer; keine Linux-Implementierungsuebernahme.
+- Protokollkonstanten anhand der eingefrorenen Linux-7.2.4-Referenz
+  sound/hda/codecs/hdmi/atihdmi.c abgeglichen (GPL-2.0-or-later, nur Referenz).
+- Kanonische ELD bleibt die Kopie des Grafikbesitzers. Der HDA-Code baut keine
+  Linux-ELD nach, sondern verlangt Gleichheit von PortID, Identitaet und dem
+  explizit zugelassenen Stereo-48k-S16-Profil mit Hardwareantworten.

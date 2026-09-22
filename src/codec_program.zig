@@ -154,6 +154,7 @@ pub const PlanInput = struct {
     pin_role: PinRole = .line_out,
     display_port: bool = false,
     nvidia_dp_layout: bool = false,
+    amd_hdmi_rev3: bool = false,
     pcm_caps: u32 = 0,
     stream_caps: u32 = 0,
     route_count: u8 = 0,
@@ -178,6 +179,12 @@ pub const OperationKind = enum(u8) {
     set_dip_index,
     set_dip_byte,
     set_dip_xmit,
+    set_amd_allocation,
+    set_amd_downmix,
+    set_amd_remap,
+    set_amd_slot,
+    set_amd_ramp,
+    clear_amd_hbr,
 };
 
 pub const Operation = struct {
@@ -273,19 +280,30 @@ pub fn buildPlan(input: *const PlanInput) ?ProgramPlan {
     if (input.pin_role == .hdmi) {
         if (!plan.append(.{ .kind = .set_digital, .node = converter.node, .value = 1 }) or
             !plan.append(.{ .kind = .set_channel_count, .node = converter.node, .value = 1 })) return null;
-        // Unused HDMI slots are disabled; only channels 0/1 carry PCM.
-        for (0..8) |slot| {
-            const channel: u16 = if (slot < 2) @intCast(slot) else 15;
-            if (!plan.append(.{ .kind = .set_hdmi_slot, .node = pin.node, .value = (channel << 4) | @as(u16, @intCast(slot)) })) return null;
+        if (input.amd_hdmi_rev3) {
+            if (input.display_port) return null;
+            if (!plan.append(.{ .kind = .set_amd_allocation, .node = pin.node }) or
+                !plan.append(.{ .kind = .set_amd_downmix, .node = pin.node }) or
+                !plan.append(.{ .kind = .set_amd_remap, .node = pin.node, .value = 1 }) or
+                !plan.append(.{ .kind = .clear_amd_hbr, .node = pin.node }) or
+                !plan.append(.{ .kind = .set_amd_ramp, .node = converter.node, .value = 180 })) return null;
+            for (0..8) |slot| if (!plan.append(.{ .kind = .set_amd_slot, .node = pin.node, .value = @intCast(slot) })) return null;
+        } else {
+            // Unused HDMI slots are disabled; only channels 0/1 carry PCM.
+            for (0..8) |slot| {
+                const channel: u16 = if (slot < 2) @intCast(slot) else 15;
+                if (!plan.append(.{ .kind = .set_hdmi_slot, .node = pin.node, .value = (channel << 4) | @as(u16, @intCast(slot)) })) return null;
+            }
+            if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
+                !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node }) or
+                !plan.append(.{ .kind = .set_dip_index, .node = pin.node })) return null;
+            for (hdmi.stereoPacket(input.display_port, input.nvidia_dp_layout)) |byte| {
+                if (!plan.append(.{ .kind = .set_dip_byte, .node = pin.node, .value = byte })) return null;
+            }
+            if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
+                !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node, .value = 0xc0 })) return null;
         }
-        if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
-            !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node }) or
-            !plan.append(.{ .kind = .set_dip_index, .node = pin.node })) return null;
-        for (hdmi.stereoPacket(input.display_port, input.nvidia_dp_layout)) |byte| {
-            if (!plan.append(.{ .kind = .set_dip_byte, .node = pin.node, .value = byte })) return null;
-        }
-        if (!plan.append(.{ .kind = .set_dip_index, .node = pin.node }) or
-            !plan.append(.{ .kind = .set_dip_xmit, .node = pin.node, .value = 0xc0 })) return null;
+
     }
     if (!plan.append(.{ .kind = .set_stream, .node = converter.node, .value = stream_value }) or
         !plan.append(.{ .kind = .verify_stream, .node = converter.node, .value = stream_value })) return null;
@@ -333,6 +351,21 @@ test "HDMI route sets digital PCM stereo mapping and complete infoframe before s
         else => {},
     };
     try std.testing.expectEqualSlices(u8, &hdmi.stereoInfoFrame(), &packet);
+    input.amd_hdmi_rev3 = true;
+    const amd_plan = buildPlan(&input).?;
+    var amd_slots: usize = 0; var remap_seen = false; var pcm_seen = false; var ramp_seen = false;
+    for (amd_plan.slice()) |op| switch (op.kind) {
+        .set_dip_index, .set_dip_byte, .set_dip_xmit, .set_hdmi_slot => return error.TestUnexpectedResult,
+        .set_amd_remap => { try std.testing.expect(op.node == 4 and op.value == 1); remap_seen = true; },
+        .clear_amd_hbr => { try std.testing.expect(op.node == 4); pcm_seen = true; },
+        .set_amd_ramp => { try std.testing.expect(op.node == 3 and op.value == 180); ramp_seen = true; },
+        .set_amd_slot => { try std.testing.expect(op.node == 4 and op.value == amd_slots); amd_slots += 1; },
+        .set_stream => try std.testing.expect(amd_slots == 8 and remap_seen and pcm_seen and ramp_seen),
+        else => {},
+    };
+    input.display_port = true; input.pin_caps |= hdmi.pin_cap_dp;
+    try std.testing.expect(buildPlan(&input) == null);
+    input.amd_hdmi_rev3 = false; input.display_port = false; input.pin_caps &= ~hdmi.pin_cap_dp;
     input.display_port = true;
     try std.testing.expect(buildPlan(&input) == null); // HDMI-only pin cannot carry DP.
     input.pin_caps = pin_cap_output | hdmi.pin_cap_dp;

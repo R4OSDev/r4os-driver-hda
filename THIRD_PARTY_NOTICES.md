@@ -12,3 +12,11 @@ These GPL-2.0-or-later files are reference-only, archived with their original
 notices and full GPL under GFX/0.79.23/displayport-20260914. No Linux source or
 implementation is copied or linked into HDA.R4D; the packet encoder is original
 R4OS code implementing protocol values.
+
+AMD display-codec support (0.80.22): published register/protocol values and
+revision gating were cross-checked against Linux 7.2.4
+sound/hda/codecs/hdmi/atihdmi.c, stored with its GPL-2.0-or-later notice in
+ExFiles/Reference/AMD/Implementations/Linux. This is reference-only material;
+no GPL source is copied, translated or linked into HDA.R4D. amd_hdmi.zig is
+original R4OS code validating an already-canonical, narrowly supported ELD
+against physical vendor responses, not the Linux ELD reconstruction routine.
