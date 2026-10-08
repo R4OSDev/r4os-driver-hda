@@ -86,8 +86,8 @@ pub fn inspect(sense: u32, eld: []const u8) Sink {
 pub fn associate(sink: Sink, bytes: []const u8, route: anytype, ready: bool) Sink {
     var result = sink;
     if (!ready or route.source.generation == 0 or route.receiver_sequence == 0 or route.revision == 0 or
-        route.eld_bytes != bytes.len or bytes.len > route.eld.len or
-        !std.mem.eql(u8, &route.port_id, &sink.port_id) or !std.mem.eql(u8, bytes, route.eld[0..bytes.len])) {
+        route.eld_bytes > route.eld.len or bytes.len > max_eld_bytes or
+        !std.mem.eql(u8, &route.port_id, &sink.port_id) or !sameEld(bytes, route.eld[0..route.eld_bytes], sink.baseline_bytes)) {
         result.availability = .waiting_for_eld;
         return result;
     }
@@ -99,6 +99,20 @@ pub fn associate(sink: Sink, bytes: []const u8, route: anytype, ready: bool) Sin
     result.display_head = route.head_id;
     result.display_device_entry = route.device_entry;
     return result;
+}
+
+/// A codec's ELD buffer capacity can differ from the GPU control's fixed
+/// array. Both complete reads must contain the same declared baseline; only
+/// entirely zero padding may account for different buffer lengths. Content,
+/// truncation and nonzero extension bytes never gain that exception.
+fn sameEld(actual: []const u8, expected: []const u8, baseline: usize) bool {
+    if (actual.len == expected.len) return std.mem.eql(u8, actual, expected);
+    if (baseline < 20 or baseline > actual.len or baseline > expected.len or
+        baseline != 4 + @as(usize, actual[2]) * 4 or baseline != 4 + @as(usize, expected[2]) * 4 or
+        !std.mem.eql(u8, actual[0..baseline], expected[0..baseline])) return false;
+    for (actual[baseline..]) |byte| if (byte != 0) return false;
+    for (expected[baseline..]) |byte| if (byte != 0) return false;
+    return true;
 }
 
 pub fn sameReceiver(left: Sink, right: Sink) bool {
@@ -181,8 +195,9 @@ test "HDMI sink requires complete ELD and exact stereo PCM capabilities" {
         source: struct { generation: u64 = 8, adapter_id: u32 = 9 } = .{},
         receiver_sequence: u64 = 2, revision: u64 = 3, connector_id: u32 = 4,
         head_id: u32 = 2, device_entry: u32 = 0, eld_bytes: u32 = 32,
-        port_id: [8]u8 = @splat(0), eld: [32]u8,
-    }{ .eld = eld };
+        port_id: [8]u8 = @splat(0), eld: [96]u8 = @splat(0),
+    }{};
+    @memcpy(route.eld[0..eld.len], &eld);
     const bound = associate(plain, &eld, route, true);
     try std.testing.expect(bound.availability == .ready and bound.display_connector == 4 and bound.display_head == 2 and bound.display_device_entry == 0);
     try std.testing.expect(!sameReceiver(plain, bound));
@@ -192,6 +207,28 @@ test "HDMI sink requires complete ELD and exact stereo PCM capabilities" {
     try std.testing.expect(!sameReceiver(bound, newer) and sameDisplayPort(bound, newer));
     route.eld[25] = 2;
     try std.testing.expect(associate(plain, &eld, route, true).availability == .waiting_for_eld);
+    route.eld[25] = 4;
+    // Real GA106: GET_ELD_SIZE reports95 while the confirmed RM control
+    // carries96. All declared ELD bytes must still match, including SADs.
+    route.eld_bytes = 96;
+    var physical: [95]u8 = @splat(0);
+    @memcpy(physical[0..eld.len], &eld);
+    try std.testing.expect(associate(plain, &physical, route, true).availability == .ready);
+    try std.testing.expect(associate(plain, physical[0..31], route, true).availability == .waiting_for_eld);
+    physical[94] = 1;
+    try std.testing.expect(associate(plain, &physical, route, true).availability == .waiting_for_eld);
+    physical[94] = 0; route.eld[95] = 1;
+    try std.testing.expect(associate(plain, &physical, route, true).availability == .waiting_for_eld);
+    route.eld[95] = 0;
+    for ([_]usize{0, 2, 8, 24, 25, 31}) |at| {
+        route.eld[at] ^= 1;
+        try std.testing.expect(associate(plain, &physical, route, true).availability == .waiting_for_eld);
+        route.eld[at] ^= 1;
+    }
+    route.port_id[0] = 1;
+    try std.testing.expect(associate(plain, &physical, route, true).availability == .waiting_for_eld);
+    route.port_id[0] = 0; route.revision = 0;
+    try std.testing.expect(associate(plain, &physical, route, true).availability == .waiting_for_eld);
 }
 
 test "HDMI stereo infoframe carries stereo allocation and valid checksum" {

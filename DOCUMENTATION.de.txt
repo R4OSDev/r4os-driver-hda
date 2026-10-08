@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.18
+﻿HDA.R4D 0.3.23
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -22,7 +22,12 @@ die bestehenden Instanzen; im laufenden Audiopfad gibt es keine PCI-Suche.
 
 HDMI koppelt seit 0.3.18 physische PD/ELDV und vollstaendig gelesene ELD-
 Bytes an die aktuelle Displayquelle, Empfaengersequenz und Publikations-
-revision. Der ELD-Port ordnet den echten Pin dem Connector zu; Head und
+revision. Seit0.3.23 duerfen die Codec- und RM-Puffer verschieden lang
+sein, wenn ihre vollstaendige deklarierte ELD-Baseline bytegleich ist
+und beide Restbereiche ausschliesslich nullgefuellt sind. Fehlende Bytes,
+abweichende SADs, Header oder nicht-nullgefuellte Reste bleiben gesperrt.
+Der Treiber liest weiterhin jeden vom Codec gemeldeten ELD-Bytewert.
+Der ELD-Port ordnet den echten Pin dem Connector zu; Head und
 Device Entry werden nicht als Pin-NID interpretiert. Unklare doppelte
 Zuordnung sperrt die Pins. Neue Revision, Kabelverlust oder fehlende
 Freigabe stoppen die aktive alte Route. Wiederaufnahme verlangt erneute
@@ -60,6 +65,10 @@ solicited Antwort ueber die erweiterte Codecadresse zu. Unsolicited oder an
 einen anderen Codec adressierte Eintraege werden nicht als Antwort des
 laufenden Kommandos akzeptiert. Reset, Stop, Ringvollstand und Antwort besitzen
 monotone Zeitfristen; Speicherfehler und RIRB-Overrun brechen sichtbar ab.
+Seit0.3.22 werden unmittelbare solicited Antworten zunaechst hoechstens
+64mal gepollt. Danach gilt derselbe Task-Wartepfad; Codec-Zuordnung und
+100ms-Kommandofrist bleiben unveraendert. Das vermeidet eine ganze
+Tickwartezeit pro ELD-Byte und behaelt den begrenzten Fehlerpfad.
 
 Immediate Command ist kein automatischer Ersatz. Nur
 `OPTION HDA immediate=on` erlaubt nach einem fehlgeschlagenen CORB/RIRB-Pfad
@@ -299,3 +308,16 @@ IRQs werden weiter quittiert und Fehler gelatcht. So kann ein am Stream-Lock
 scheiternder Worker Close nicht durch staendige Selbstanmeldung verdraengen.
 Der normale IRQ-Pfad wird nach Stop wieder freigegeben. Drain-Frist und
 erzwungener Fehlerabbau bleiben unveraendert.
+
+
+TV-Nacharbeit 0.82.37 / 06.10.2026
+----------------------------------
+OssiPC/K244/N255/HDA23: Hisense-HDMI-Pin6 liefert95 reale ELD-Bytes,
+die40-Byte-Baseline stimmt mit dem96-Byte-RM-Puffer ueberein.53bestehende
+Hosttests und ein40ms-48kHz-Stereo-S16LE-Lauf bestehen:7680Bytes,
+8Writes, DMA+LPIB/7IRQs, keine Underrun-/FIFO-/Descriptor-/Timeout-/
+Drainfehler. Explizite Analogwahl ueberlebt echten720p/1080p-KEEP;
+urspruengliches AUTO und Masterwerte sind restauriert. HDA21–23-
+Diagnosemarker sind vor Abschluss zu entfernen. A/V-Zeitbasis und
+Hoerabnahme bleiben offen; Belege:
+ExFiles/Reports/OssiGPU/20261005-tv08237/Checkpoint.txt.

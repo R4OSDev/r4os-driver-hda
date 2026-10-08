@@ -325,6 +325,7 @@ const State = struct {
     output_poll_tick: u64 = 0,
     display_audio: ?r4os.driver_outputs.Context = null,
     display_audio_managed: bool = false,
+    // Temporary 0.82.37 diagnosis: at most one ELD failure per physical pin.
     explicit_output: bool = false,
     backend_registered: bool = false,
     present: bool = false,
@@ -1251,24 +1252,33 @@ fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, 
         if (rc < 0) return .{ .availability = .waiting_for_eld };
         if (rc == 1) state.display_audio_managed = true;
     }
-    const sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse return .{ .availability = .invalid_eld };
+    const sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse
+        return .{ .availability = .invalid_eld };
     if ((sense & (hdmi.sense_present | hdmi.sense_eld_valid)) != (hdmi.sense_present | hdmi.sense_eld_valid)) return hdmi.inspect(sense, &.{});
     if (state.info.vendor_id == 0x1002 and state.info.device_id == 0x15de) {
         if (!amdDisplayCodec(state, codec)) return .{ .availability = .unsupported };
         return readAmdSink(state, ctx, codec, pin, location, device);
     }
-    const size = sendVerb(state, makeVerb(codec, pin, hdmi.get_eld_size, 8)) orelse return .{ .availability = .invalid_eld };
-    if (size < 20 or size > hdmi.max_eld_bytes) return .{ .availability = .invalid_eld };
+    const size = sendVerb(state, makeVerb(codec, pin, hdmi.get_eld_size, 8)) orelse
+        return .{ .availability = .invalid_eld };
+    if (size < 20 or size > hdmi.max_eld_bytes)
+        return .{ .availability = .invalid_eld };
     var bytes: [hdmi.max_eld_bytes]u8 = undefined;
     const deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS);
     for (bytes[0..size], 0..) |*byte, index| {
-        if (ctx.tickCount() >= deadline) return .{ .availability = .invalid_eld };
-        const value = sendVerb(state, makeVerb(codec, pin, hdmi.get_eld_byte, @intCast(index))) orelse return .{ .availability = .invalid_eld };
-        if ((value & hdmi.eld_byte_valid) == 0) return .{ .availability = .invalid_eld };
+        if (ctx.tickCount() >= deadline)
+            return .{ .availability = .invalid_eld };
+        const value = sendVerb(state, makeVerb(codec, pin, hdmi.get_eld_byte, @intCast(index))) orelse
+            return .{ .availability = .invalid_eld };
+        if ((value & hdmi.eld_byte_valid) == 0)
+            return .{ .availability = .invalid_eld };
         byte.* = @truncate(value);
     }
-    const final_sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse return .{ .availability = .invalid_eld };
+    const final_sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse
+        return .{ .availability = .invalid_eld };
     var sink = hdmi.inspect(final_sense, bytes[0..size]);
+    if (sink.availability == .invalid_eld)
+        return .{ .availability = .invalid_eld };
     if (!state.display_audio_managed or sink.availability != .ready) return sink;
     const outputs = state.display_audio orelse return .{ .availability = .waiting_for_eld };
     var index: u32 = 0;
@@ -2931,6 +2941,11 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
     state.command_count +%= 1;
     write16(base + REG_CORBWP, next_wp);
 
+    // Give this solicited DMA response one bounded short polling burst before
+    // sleeping. One tick per normally immediate reply can exhaust an entire
+    // ELD read's unchanged 100-ms deadline. Missing replies still yield and
+    // expire through that same command deadline and existing wait path.
+    var response_polls: usize = 0;
     while (ctx.tickCount() <= deadline) {
         const corb_status = read8(base + REG_CORBSTS);
         const rirb_status = read8(base + REG_RIRBSTS);
@@ -2961,6 +2976,11 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
             return response.value;
         }
         if ((rirb_status & RIRBSTS_RESPONSE) != 0) write8(base + REG_RIRBSTS, RIRBSTS_RESPONSE);
+        response_polls += 1;
+        if (response_polls < 64) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
         ctx.waitTicks(1);
     }
     state.timeout_count +%= 1;
