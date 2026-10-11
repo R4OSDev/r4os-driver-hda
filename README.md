@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.20`
+- Version: `0.3.39`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -12,9 +12,9 @@
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
 
-HDA enumerates every bounded PCI class-04/03 candidate and selects a
-complete analog-capable controller from codec evidence instead of accepting
-the first function. Each candidate follows an explicit quiesce/reset/
+HDA enumerates bounded PCI class-04/03 candidates and initializes each viable
+controller from codec evidence. Analog and digital controllers expose
+independent output catalogs. Each candidate follows an explicit quiesce/reset/
 STATESTS lifecycle. CORB/RIRB is the regular verb transport with negotiated
 ring sizes, codec-matched responses and monotone timeouts. Immediate Commands
 are used only when `OPTION HDA immediate=on` explicitly enables the visible
@@ -26,12 +26,21 @@ are emitted again beside every compact close diagnostic, so an acceptance
 tool can export the complete selection decision before the log window
 advances, even when other applications played audio first.
 
+NVIDIA PCIe controllers disable and verify No Snoop in their own Device Control
+register before starting DMA into normal cached RAM. Legacy PCI controllers
+use the vendor stream/transport snoop bits; modern GPUs need not implement
+those old registers. Setup follows controller reset. Teardown restores
+the original owned configuration bits only after all DMA stops; a failed
+restoration retains the controller identity for cleanup. Other PCI bits and
+non-NVIDIA controllers remain unchanged.
+
 Short- and long-form connection lists, including range entries, are expanded
 into a bounded per-codec graph. Controller evidence is viable only when this
-graph proves a complete analog pin-to-converter route whose widgets and PCM
+graph proves a complete pin-to-converter route whose widgets and PCM
 capabilities support 48-kHz stereo S16. Pin defaults rank speaker, headphone,
-and line-out routes deterministically by association and sequence; digital
-pins never enter that selection.
+and line-out routes deterministically by association and sequence. HDMI/DP
+routes additionally require current receiver and ELD evidence; digital pins
+never enter the analog ranking.
 
 The resulting verb plan powers the function group and required widgets to D0,
 clears and verifies the converter stream, programs and verifies format
@@ -42,6 +51,13 @@ pins are checked through bounded status polling; without usable jack evidence
 the selected speaker/line-out/headphone fallback remains fixed and visible in
 the driver log.
 
+Before each physical PCM or HDMI carrier start, HDA separately programs and
+reads back the nonzero stream tag/direction while the descriptor is stopped.
+Only then may it set `RUN`. A receiver appearing after initial DMA setup must
+not keep the unassigned stream0 binding. Unconfirmed control refuses DMA
+startup and leaves queued resources for the existing cleanup path. Ordinary
+logical HDMI stream closes keep the established silent carrier; route changes
+and driver shutdown retain their physical stop boundary.
 The hardware stream is selected within the exact GCAP descriptor range. A
 dedicated output descriptor is preferred; a bidirectional descriptor is used
 only with its output-direction bit and only after route and 48-kHz stereo S16
@@ -84,6 +100,16 @@ releasing the stream lock, so the shared queue returns to zero retained HDA
 slots while idle. Completion inspection and release are serialized outside
 IRQ context, and shutdown joins all retained work before position, ring or BDL
 DMA is disabled and freed.
+
+A selected, available HDMI sink keeps its cleared DMA ring running between
+tones with completion IRQs disabled. This prevents the receiver's acquisition
+delay from swallowing short sounds. After a physical clock start, writes
+return Busy for up to one second before accepting PCM. Warm writes resume
+from the actual hardware position with two silent lead periods. There is no
+periodic quiet refill work; DMA still transfers 192,000 bytes/s. Analog and
+DisplayPort retain the stopped-ring idle path. The appended AudioBackend v4
+Idle callback needs Kernel 0.1.259; install these artifacts atomically. Route
+replacement, receiver loss and shutdown continue to require physical Stop.
 
 An explicit ownership ledger covers PCI, MMIO, reset, transport, discovery,
 route, stream/position DMA, IRQ, backend and Driver Work. Partial

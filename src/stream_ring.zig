@@ -132,6 +132,24 @@ pub const PeriodBook = struct {
         return true;
     }
 
+    /// The hardware is already cycling a completely silent ring without
+    /// completion IRQs. Rebind ownership at its current position and reserve
+    /// a bounded silent lead before publishing new caller PCM. The active
+    /// period is never writable; an invalid/nonempty book is unchanged.
+    pub fn resumeSilent(self: *PeriodBook, current: usize, lead: usize) bool {
+        if (self.running or self.queued != 0 or self.count < 4 or current >= self.count or
+            lead == 0 or lead > self.count - 2) return false;
+        for (self.ready[0..self.count]) |ready| if (ready) return false;
+        self.current = current;
+        self.running = true;
+        self.producer = (current + 1) % self.count;
+        for (0..lead) |_| {
+            const slot = self.nextWritable() orelse unreachable;
+            if (!self.commit(slot)) unreachable;
+        }
+        return true;
+    }
+
     pub fn advance(self: *PeriodBook, current: usize) Advance {
         if (!self.running or current >= self.count or current == self.current) return .{};
         var result: Advance = .{};
@@ -302,4 +320,40 @@ test "idle stop waits for codec postroll and new PCM cancels it" {
     postroll.reset();
     try std.testing.expect(!postroll.observe(true, 8, 3));
     try std.testing.expect(postroll.observe(true, 8, 3));
+}
+
+test "silent carrier resumes at live position with bounded lead and no stale ownership" {
+    const std = @import("std");
+    for (0..8) |current| {
+        var book = PeriodBook.init(8);
+        try std.testing.expect(book.resumeSilent(current, 2));
+        const signal = book.nextWritable().?;
+        try std.testing.expectEqual((current + 3) % 8, signal);
+        try std.testing.expect(signal != current);
+        try std.testing.expect(book.commit(signal));
+        const saved = book;
+        try std.testing.expect(!book.resumeSilent(current, 2));
+        try std.testing.expectEqualDeep(saved, book);
+        const lead = book.advance((current + 2) % 8);
+        try std.testing.expectEqual(@as(usize, 0), lead.starved);
+        try std.testing.expectEqual(@as(usize, 2), book.queued);
+        const signal_start = book.advance(signal);
+        try std.testing.expectEqual(@as(usize, 0), signal_start.starved);
+        try std.testing.expectEqual(@as(usize, 1), book.queued);
+        _ = book.advance((signal + 1) % 8);
+        try std.testing.expectEqual(@as(usize, 0), book.queued);
+        book.reset();
+        try std.testing.expect(book.resumeSilent((current + 5) % 8, 2));
+    }
+    var book = PeriodBook.init(8);
+    for ([_]usize{ 0, 7, 8, 256 }) |lead| {
+        const saved = book;
+        try std.testing.expect(!book.resumeSilent(0, lead));
+        try std.testing.expectEqualDeep(saved, book);
+    }
+    try std.testing.expect(!book.resumeSilent(8, 2));
+    try std.testing.expect(book.commit(3));
+    const saved = book;
+    try std.testing.expect(!book.resumeSilent(0, 2));
+    try std.testing.expectEqualDeep(saved, book);
 }

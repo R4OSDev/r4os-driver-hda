@@ -5,6 +5,7 @@ const stream_ring = @import("stream_ring.zig");
 const work_gate = @import("work_gate.zig");
 const controller_policy = @import("controller_policy.zig");
 const controller_reset = @import("controller_reset.zig");
+const dma_coherency = @import("dma_coherency.zig");
 const command_ring = @import("command_ring.zig");
 const codec_inventory = @import("codec_inventory.zig");
 const codec_topology = @import("codec_topology.zig");
@@ -105,6 +106,11 @@ const POSITION_SKEW_BYTES: u32 = DMA_BUFFER_BYTES * 2;
 const POSITION_FAILURE_LIMIT: u8 = 3;
 const HARDWARE_BYTES_PER_SECOND: u32 = pcm.TARGET_RATE * pcm.TARGET_FRAME_BYTES;
 const DRAIN_POSTROLL_PERIODS: usize = 3;
+const CARRIER_LEAD_PERIODS: usize = 2;
+// Bounded acquisition only after a physical HDMI clock start. The Hisense
+// hardware probe loses a 0.5s cold signal, but preserves it after 1s of real
+// zero PCM. Subsequent tones keep this carrier and incur no repeated wait.
+const CARRIER_ACQUIRE_MS: u64 = 1000;
 const IRQ_ROUTE_CAPACITY: usize = 1;
 const WORK_HANDLE_CAPACITY: usize = 2;
 const REFILL_DEADLINE_MS: u64 = 10;
@@ -313,12 +319,13 @@ const State = struct {
     route_program_plan: codec_program.ProgramPlan = .{},
     initialized: bool = false,
     info: r4os.abi.PciDeviceInfo = .{},
+    coherency: dma_coherency.Configuration = .{},
     mmio: r4os.abi.MmioRegion = .{},
     controller_candidate_count: u8 = 0,
     controller_rejected_count: u8 = 0,
     controller_candidates: [MAX_CONTROLLER_CANDIDATES]ControllerCandidateSnapshot = .{ControllerCandidateSnapshot{}} ** MAX_CONTROLLER_CANDIDATES,
     selected_inventory_index: u32 = ~@as(u32, 0),
-    backend: r4os.r4dev.AudioOutputBackend = .{ .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput } },
+    backend: r4os.r4dev.AudioOutputIdleBackend = .{ .base = .{ .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput } }, .idle = idlePlaybackBackend },
     output_catalog: [32]OutputCandidate = .{OutputCandidate{}} ** 32,
     output_count: usize = 0,
     active_output_index: i32 = -1,
@@ -418,6 +425,14 @@ const State = struct {
     periods: stream_ring.PeriodBook = .{},
     pcm_queue: stream_ring.ByteQueue = .{},
     playback_started: bool = false,
+    // Empty selected HDMI output keeps its PCM clock using the owned zero
+    // ring. IOCE is disabled: no periodic IRQ, refill job or user stream.
+    silent_carrier: bool = false,
+    carrier_starts: u64 = 0,
+    carrier_entries: u64 = 0,
+    carrier_resumes: u64 = 0,
+    carrier_lead_periods: u64 = 0,
+    carrier_ready_tick: u64 = 0,
     draining: bool = false,
     start_due_tick: u64 = 0,
     underrun_active: bool = false,
@@ -648,6 +663,13 @@ fn initializeControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverCon
     state.lifecycle.acquireAtomic(.reset);
 
     state.stage = .transport;
+    const pci_coherency = CoherencyIo{ .ctx = ctx, .info = info };
+    if (!state.coherency.enable(info.vendor_id, &pci_coherency)) {
+        ctx.logError("HDA.R4D DMA coherency setup failed");
+        failStage(state, .transport);
+        return false;
+    }
+    logCoherency(state, ctx, "ready");
     if (!setupCommandTransport(state, ctx)) {
         failStage(state, .transport);
         return false;
@@ -689,9 +711,43 @@ fn collectControllerEvidence(state: *State, inventory_index: u32) controller_pol
     };
 }
 
+const CoherencyIo = struct {
+    ctx: *const r4os.r4dev.DriverContext,
+    info: r4os.abi.PciDeviceInfo,
+
+    pub fn read(self: *const CoherencyIo, offset: u16) u32 {
+        return self.ctx.pciReadConfig32(self.info, offset);
+    }
+
+    pub fn write(self: *const CoherencyIo, offset: u16, value: u32) bool {
+        return self.ctx.pciWriteConfig32(self.info, offset, value) == 0;
+    }
+};
+
+fn logCoherency(state: *State, ctx: *const r4os.r4dev.DriverContext, phase: []const u8) void {
+    const original = state.coherency.original orelse return;
+    const observed = state.coherency.observed orelse return;
+    var line: [240:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.COH "); appendText(&line, &len, phase);
+    appendText(&line, &len, " pci="); appendDec(&line, &len, state.info.bus);
+    appendText(&line, &len, ":"); appendDec(&line, &len, state.info.device);
+    appendText(&line, &len, "."); appendDec(&line, &len, state.info.function);
+    appendText(&line, &len, " cfg="); appendHex(&line, &len, state.coherency.offset, 4);
+    appendText(&line, &len, " before="); appendHex(&line, &len, original, 8);
+    appendText(&line, &len, " after="); appendHex(&line, &len, observed, 8);
+    logLine(ctx, &line, len);
+}
+
 fn cleanupControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, restore_command: bool) bool {
     if (state.mmio.virt_addr != 0) write32(mmioBase(state) + REG_INTCTL, 0);
     if (!shutdownCommandTransport(state, ctx)) return false;
+    const pci_coherency = CoherencyIo{ .ctx = ctx, .info = state.info };
+    if (!state.coherency.restore(&pci_coherency)) {
+        ctx.logWarn("HDA.R4D DMA coherency restore unconfirmed");
+        return false;
+    }
+    logCoherency(state, ctx, "restored");
     state.codec_ready = false;
     _ = state.lifecycle.releaseAtomic(.discovery);
     state.reset_done = false;
@@ -710,6 +766,8 @@ fn cleanupControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverContex
 }
 
 fn clearControllerCandidateState(state: *State) void {
+    std.debug.assert(!state.coherency.restore_pending);
+    state.coherency = .{};
     state.info = .{};
     state.mmio = .{};
     state.stage = .none;
@@ -1745,6 +1803,8 @@ fn resetStreamDescriptor(state: *State, ctx: *const r4os.r4dev.DriverContext) bo
         noteHdaWarn(state, ctx, "output stream did not stop");
         return false;
     }
+    @atomicStore(bool, &state.silent_carrier, false, .release);
+    state.carrier_ready_tick = 0;
     write32(state.stream_desc_base + SD_CTL, read32(state.stream_desc_base + SD_CTL) | SD_CTL_SRST);
     if (!wait32Set(state.stream_desc_base + SD_CTL, SD_CTL_SRST, STREAM_GUARD)) {
         noteHdaWarn(state, ctx, "output stream reset did not assert");
@@ -1761,6 +1821,28 @@ fn resetStreamDescriptor(state: *State, ctx: *const r4os.r4dev.DriverContext) bo
     return true;
 }
 
+const StoppedStreamControl = struct {
+    state: *State,
+
+    pub fn readControl(self: *@This()) u32 {
+        return read32(self.state.stream_desc_base + SD_CTL);
+    }
+
+    pub fn writeControl(self: *@This(), value: u32) void {
+        write32(self.state.stream_desc_base + SD_CTL, value);
+    }
+};
+
+fn prepareStreamStartControl(state: *State) bool {
+    var control = StoppedStreamControl{ .state = state };
+    if (stream_hardware.prepareStoppedControl(&control, streamControlBase(state))) return true;
+    state.error_count += 1;
+    state.last_error = "stopped stream binding unconfirmed";
+    state.output_path_ok = false;
+    const ctx = context(state);
+    ctx.logError("HDA.R4D stopped stream binding unconfirmed; DMA start refused");
+    return false;
+}
 fn streamControlBase(state: *State) u32 {
     const stream_bits: u32 = @as(u32, state.output_stream_id & 0x0F) << SD_CTL_STREAM_SHIFT;
     return stream_bits | (if (state.stream_desc_bidirectional) SD_CTL_DIRECTION_OUTPUT else 0);
@@ -1915,6 +1997,12 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
     const stream_mask = @as(u32, 1) << @intCast(s.stream_desc_index);
     const int_status = read32(s.mmio.virt_addr + REG_INTSTS);
     const stream_status = read8(s.stream_desc_base + SD_STS);
+    if (@atomicLoad(bool, &s.silent_carrier, .acquire) and (stream_status & (SD_STS_FIFOE | SD_STS_DESE)) == 0) {
+        // A final in-flight MSI or an unrelated shared IRQ can observe BCIS
+        // even with IOCE clear. Silent ring laps are not refill work.
+        if ((stream_status & SD_STS_BCIS) != 0) write8(s.stream_desc_base + SD_STS, SD_STS_BCIS);
+        return if ((int_status & stream_mask) != 0) r4os.abi.irq_result_handled else 0;
+    }
     const event = irq_recovery.decodeStatus(stream_status);
     if ((int_status & stream_mask) == 0 and event.acknowledge == 0) {
         _ = @atomicRmw(u64, &s.irq_unhandled, .Add, 1, .acq_rel);
@@ -2071,9 +2159,9 @@ fn waitRunClear(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
-    state.backend.base = .{
-        .version = r4os.abi.audio_backend_outputs_version,
-        .size = @sizeOf(r4os.r4dev.AudioOutputBackend),
+    state.backend.base.base = .{
+        .version = r4os.abi.audio_backend_idle_version,
+        .size = @sizeOf(r4os.r4dev.AudioOutputIdleBackend),
         .formats = r4os.abi.audio_backend_format_s16le | r4os.abi.audio_backend_format_u8,
         .min_rate = MIN_RATE,
         .max_rate = MAX_RATE,
@@ -2085,7 +2173,7 @@ fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) 
         .shutdown = shutdownBackend,
         .status = backendStatus,
     };
-    const rc = ctx.registerAudioOutputs(&state.backend_name, &state.backend);
+    const rc = ctx.registerAudioOutputIdle(&state.backend_name, &state.backend);
     state.last_result = rc;
     if (rc != 0) {
         state.error_count += 1;
@@ -2213,7 +2301,7 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
     if (outputAvailability(candidate) != r4os.abi.audio_output_available) return -1;
     if (@atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index)) and state.output_path_ok) {
         state.explicit_output = true;
-        return 0;
+        return if (prepareSelectedCarrier(state)) 0 else -1;
     }
     if (!stopPlayback(state, &ctx, true)) return -1;
     // Keep the previous route available for rollback. No PCI discovery,
@@ -2221,7 +2309,7 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
     if (!switchOutputCandidate(state, &ctx, candidate)) return -1;
     state.lifecycle.acquireAtomic(.route);
     state.explicit_output = true;
-    return 0;
+    return if (prepareSelectedCarrier(state)) 0 else -1;
 }
 
 fn activeOutput(raw: u64) callconv(.c) i32 {
@@ -2248,6 +2336,13 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     pollJackAndSwitch(state, &ctx);
     refreshOutputs(state, &ctx);
     if (!state.output_path_ok) return finishWrite(state, -1, write_start);
+    // Initial automatic selection and a recovered stream can reach Write
+    // without an explicit output-selection callback. Prime an empty HDMI
+    // stream before accepting caller PCM in those paths as well.
+    if (!state.playback_started and state.periods.queued == 0 and state.pcm_queue.used == 0 and
+        !prepareSelectedCarrier(state)) return finishWrite(state, -1, write_start);
+    if (@atomicLoad(bool, &state.silent_carrier, .acquire) and ctx.tickCount() < state.carrier_ready_tick)
+        return finishWrite(state, r4os.abi.service_api_result_busy, write_start);
     const input = data[0..@as(usize, @intCast(len))];
     const output_frames = pcm.outputFrameCount(input.len, rate, channels, format);
     if (output_frames == 0) {
@@ -2302,6 +2397,10 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     state.converted_frame_count +%= state.last_output_bytes / pcm.TARGET_FRAME_BYTES;
     state.write_count += 1;
     state.last_pcm_tick = ctx.tickCount();
+    if (@atomicLoad(bool, &state.silent_carrier, .acquire) and !resumeCarrierPcm(state, &ctx)) {
+        _ = recoverStream(state, &ctx, "silent carrier resume failed");
+        return finishWrite(state, -1, write_start);
+    }
     if (!state.playback_started and state.start_due_tick == 0)
         state.start_due_tick = state.last_pcm_tick +| msTicks(&ctx, 10);
     fillDmaPeriods(state, &ctx);
@@ -2324,6 +2423,103 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     logDiagnosticRuntime(state, &ctx, "close");
     logIdleSummary(state, &ctx);
     return setLastResult(state, if (decision.report_failure) -1 else 0);
+}
+
+fn idlePlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
+    const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
+    if (!carrierEligible(state)) return stopPlaybackBackend(context_arg);
+    var ctx = context(state);
+    if (!acquireStream(state, &ctx, 100)) return setLastResult(state, -1);
+    @atomicStore(bool, &state.synchronous_stop, true, .release);
+    const drained = drainPlayback(state, &ctx);
+    const quiet = drained and enterSilentCarrier(state);
+    if (quiet) state.resampler_state.reset();
+    if (!quiet) _ = stopPlayback(state, &ctx, false);
+    @atomicStore(bool, &state.synchronous_stop, false, .release);
+    releaseStream(state);
+    if (!releaseDriverWork(state, &ctx)) return setLastResult(state, -1);
+    logDiagnosticCore(state, &ctx);
+    logDiagnosticRuntime(state, &ctx, "close");
+    logIdleSummary(state, &ctx);
+    logCarrierSummary(state, &ctx);
+    return setLastResult(state, if (quiet) 0 else -1);
+}
+
+fn carrierEligible(state: *State) bool {
+    return state.dma_ready and state.output_path_ok and state.output.role == .hdmi and
+        !state.output.sink.display_port and state.output.sink.availability == .ready and
+        @atomicLoad(i32, &state.active_output_index, .acquire) >= 0 and
+        !@atomicLoad(bool, &state.shutting_down, .acquire);
+}
+
+fn prepareSelectedCarrier(state: *State) bool {
+    if (!carrierEligible(state) or state.playback_started) return true;
+    return enterSilentCarrier(state);
+}
+
+fn enterSilentCarrier(state: *State) bool {
+    if (!carrierEligible(state) or state.periods.queued != 0 or state.pcm_queue.used != 0) return false;
+    if (@atomicLoad(bool, &state.silent_carrier, .acquire)) return true;
+    const control = read32(state.stream_desc_base + SD_CTL);
+    if (!state.playback_started) {
+        if ((control & SD_CTL_RUN) != 0 or !prepareStreamStartControl(state)) return false;
+        clearStreamBuffers(state);
+        state.carrier_starts +%= 1;
+        const ctx = context(state);
+        state.carrier_ready_tick = ctx.tickCount() +| msTicks(&ctx, CARRIER_ACQUIRE_MS);
+    } else if ((control & SD_CTL_RUN) == 0) return false;
+    // A drained ring has already cleared every consumed caller period.
+    // Keep RUN, CBL, LVI and BDL intact. Only completion IRQs are disabled;
+    // actual FIFO/descriptor errors still have their interrupt path.
+    dmaBarrier();
+    @atomicStore(bool, &state.silent_carrier, true, .release);
+    write32(state.stream_desc_base + SD_CTL, streamControlBase(state) | SD_CTL_RUN | SD_CTL_FEIE | SD_CTL_DEIE);
+    write8(state.stream_desc_base + SD_STS, SD_STS_BCIS);
+    if ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) == 0) {
+        @atomicStore(bool, &state.silent_carrier, false, .release);
+        return false;
+    }
+    state.playback_started = false;
+    state.periods.reset();
+    state.idle_parked = false;
+    state.tail_start_pending = false;
+    state.start_due_tick = 0;
+    resetPositionTracking(state);
+    state.carrier_entries +%= 1;
+    return true;
+}
+
+fn resumeCarrierPcm(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+    const control = read32(state.stream_desc_base + SD_CTL);
+    const status = read8(state.stream_desc_base + SD_STS);
+    if ((control & SD_CTL_RUN) == 0 or (status & (SD_STS_FIFOE | SD_STS_DESE)) != 0) return false;
+    const lpib = read32(state.stream_desc_base + SD_LPIB);
+    const choice = stream_hardware.choosePosition(if (state.position_dma_degraded) null else readPositionDma(state), lpib, state.stream_total_bytes, POSITION_SKEW_BYTES, false);
+    if (!choice.valid) return false;
+    updatePositionSource(state, ctx, choice);
+    const current = (@as(usize, choice.position) / DMA_BUFFER_BYTES) % DMA_BUFFER_COUNT;
+    if (!state.periods.resumeSilent(current, CARRIER_LEAD_PERIODS)) return false;
+    resetPositionTracking(state);
+    _ = state.position_progress.observe(ctx.tickCount(), choice.position, state.stream_total_bytes, POSITION_SKEW_BYTES, msTicks(ctx, DMA_WINDOW_MS));
+    state.playback_started = true;
+    @atomicStore(bool, &state.silent_carrier, false, .release);
+    state.carrier_resumes +%= 1;
+    state.carrier_lead_periods +%= CARRIER_LEAD_PERIODS;
+    write8(state.stream_desc_base + SD_STS, SD_STS_BCIS);
+    write32(state.stream_desc_base + SD_CTL, streamControlBase(state) | SD_CTL_RUN | SD_CTL_IRQ_ENABLE);
+    return true;
+}
+
+fn logCarrierSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [240:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.CARRIER quiet="); appendDec(&line, &len, @intFromBool(@atomicLoad(bool, &state.silent_carrier, .acquire)));
+    appendText(&line, &len, " starts="); appendDec(&line, &len, state.carrier_starts);
+    appendText(&line, &len, " entries="); appendDec(&line, &len, state.carrier_entries);
+    appendText(&line, &len, " resumes="); appendDec(&line, &len, state.carrier_resumes);
+    appendText(&line, &len, " lead="); appendDec(&line, &len, state.carrier_lead_periods);
+    appendText(&line, &len, " ctl="); appendHex(&line, &len, read32(state.stream_desc_base + SD_CTL), 6);
+    logLine(ctx, &line, len);
 }
 
 fn shutdownBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
@@ -2374,6 +2570,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
 }
 
 fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+    if (@atomicLoad(bool, &state.silent_carrier, .acquire)) return;
     while (state.pcm_queue.used >= DMA_BUFFER_BYTES) {
         state.idle_postroll.reset();
         const slot = state.periods.nextWritable() orelse break;
@@ -2534,6 +2731,7 @@ fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext) 
 
 fn parkEmptyPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     if (!state.playback_started or state.periods.queued != 0) return false;
+    if (carrierEligible(state)) return enterSilentCarrier(state);
     // Stop DMA and completion IRQs before resetting ownership. Keep the
     // source queue and resampler phase belonging to the open logical stream.
     if (!resetStreamDescriptor(state, ctx)) {
@@ -2608,8 +2806,12 @@ fn recoverPositionFailure(
 }
 
 fn startPlaybackIfNeeded(state: *State) void {
-    if (state.playback_started) return;
-    if (!stream_ring.readyToStart(state.periods.queued, PREFILL_PERIODS, state.draining or state.tail_start_pending) or !state.periods.start(0)) return;
+    if (@atomicLoad(bool, &state.silent_carrier, .acquire)) return;
+    if (state.playback_started or !state.output_path_ok) return;
+    if (!stream_ring.readyToStart(state.periods.queued, PREFILL_PERIODS, state.draining or state.tail_start_pending)) return;
+    // A receiver can appear after descriptor setup with an unused stream0.
+    // Confirm the live converter's tag while stopped, before asserting RUN.
+    if (!prepareStreamStartControl(state) or !state.periods.start(0)) return;
     resetPositionTracking(state);
     clearPositionDmaEntry(state);
     write32(state.stream_desc_base + SD_CTL, streamControlBase(state) | SD_CTL_IRQ_ENABLE | SD_CTL_RUN);
@@ -2806,7 +3008,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     clearOutputPath(state);
     _ = state.lifecycle.releaseAtomic(.route);
     if (!cleanupControllerCandidate(state, ctx, true)) {
-        noteHdaWarn(state, ctx, "shutdown command transport quiesce failed");
+        noteHdaWarn(state, ctx, "shutdown controller cleanup failed");
         return false;
     }
     state.initialized = false;

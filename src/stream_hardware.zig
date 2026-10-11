@@ -89,6 +89,13 @@ fn validPosition(position: u32, cbl: u32) bool {
     return cbl != 0 and position < cbl;
 }
 
+fn canonicalPosition(position: u32, cbl: u32) u32 {
+    // HDA1.0a3.3.37 counts through CBL inclusively. That exact end is
+    // the ring's zero position, not an out-of-range memory offset. Keep
+    // all other invalid values unchanged for the normal source checks.
+    return if (cbl != 0 and position == cbl) 0 else position;
+}
+
 fn circularDistance(a: u32, b: u32, cbl: u32) u32 {
     const forward = if (a >= b) a - b else cbl - b + a;
     const reverse = if (b >= a) b - a else cbl - a + b;
@@ -98,7 +105,8 @@ fn circularDistance(a: u32, b: u32, cbl: u32) u32 {
 /// Prefer the DMA position buffer when both sources agree within a bounded
 /// read-skew.  Invalid, stale-divergent or explicitly disabled DMA data falls
 /// back to LPIB.  Both sources outside CBL are an exact failure.
-pub fn choosePosition(dma: ?u32, lpib: u32, cbl: u32, max_skew: u32, force_lpib: bool) PositionChoice {
+pub fn choosePosition(dma: ?u32, lpib_raw: u32, cbl: u32, max_skew: u32, force_lpib: bool) PositionChoice {
+    const lpib = canonicalPosition(lpib_raw, cbl);
     const lpib_valid = validPosition(lpib, cbl);
     if (force_lpib or dma == null) {
         if (!lpib_valid) return .{ .degradation = .both_invalid };
@@ -110,7 +118,7 @@ pub fn choosePosition(dma: ?u32, lpib: u32, cbl: u32, max_skew: u32, force_lpib:
         };
     }
 
-    const dma_position = dma.?;
+    const dma_position = canonicalPosition(dma.?, cbl);
     const dma_valid = validPosition(dma_position, cbl);
     if (!dma_valid and !lpib_valid) return .{ .degradation = .both_invalid };
     if (!dma_valid) return .{ .valid = true, .position = lpib, .source = .lpib, .degradation = .dma_invalid };
@@ -204,9 +212,24 @@ test "DMA position and LPIB agree across wrap and degrade deterministically" {
     try std.testing.expectEqual(PositionChoice{ .valid = true, .position = 64, .source = .dma }, choosePosition(64, 96, cbl, 1920, false));
     try std.testing.expectEqual(PositionSource.dma, choosePosition(122_700, 100, cbl, 1920, false).source);
     try std.testing.expectEqual(PositionChoice{ .valid = true, .position = 10_000, .source = .lpib, .degradation = .source_mismatch }, choosePosition(0, 10_000, cbl, 1920, false));
-    try std.testing.expectEqual(PositionDegradation.dma_invalid, choosePosition(cbl, 10, cbl, 1920, false).degradation);
-    try std.testing.expectEqual(PositionDegradation.both_invalid, choosePosition(cbl, cbl, cbl, 1920, false).degradation);
+    try std.testing.expectEqual(PositionDegradation.dma_invalid, choosePosition(cbl + 1, 10, cbl, 1920, false).degradation);
+    try std.testing.expectEqual(PositionDegradation.both_invalid, choosePosition(cbl + 1, cbl + 1, cbl, 1920, false).degradation);
     try std.testing.expectEqual(PositionDegradation.dma_unavailable, choosePosition(null, 10, cbl, 1920, false).degradation);
+    // The spec's inclusive endpoint is a wrap; larger values remain invalid.
+    const wrap = PositionChoice{ .valid = true, .position = 0, .source = .dma };
+    try std.testing.expectEqual(wrap, choosePosition(cbl, cbl, cbl, 1920, false));
+    try std.testing.expectEqual(wrap, choosePosition(cbl, 0, cbl, 1920, false));
+    try std.testing.expectEqual(wrap, choosePosition(0, cbl, cbl, 1920, false));
+    try std.testing.expectEqual(PositionChoice{ .valid = true, .position = 0, .source = .lpib, .degradation = .dma_unavailable }, choosePosition(null, cbl, cbl, 1920, false));
+    try std.testing.expectEqual(@as(u32, 0), choosePosition(12, cbl, cbl, 1920, true).position);
+    try std.testing.expect(!choosePosition(0, 0, 0, 1920, false).valid);
+    try std.testing.expect(!choosePosition(std.math.maxInt(u32), std.math.maxInt(u32), cbl, 1920, false).valid);
+    var progress = ProgressTracker{};
+    _ = progress.observe(10, cbl - 16, cbl, 1920, 64);
+    const observed = progress.observe(11, choosePosition(cbl, cbl, cbl, 1920, false).position, cbl, 1920, 64);
+    try std.testing.expectEqual(ProgressFailure.none, observed.failure);
+    try std.testing.expect(observed.moved);
+    try std.testing.expectEqual(@as(u32, 16), observed.delta);
 }
 
 test "position diagnostic distinguishes configured DMA from active fallback" {
@@ -233,4 +256,53 @@ test "impossible jump is rejected without moving the progress baseline" {
     try std.testing.expectEqual(ProgressFailure.impossible_jump, jump.failure);
     try std.testing.expectEqual(@as(u32, 100), tracker.last_position);
     try std.testing.expectEqual(@as(u32, 200), maxPlausibleAdvance(1, 1000, 100_000, 100, 10_000));
+}
+
+/// Program the link stream tag separately while DMA is stopped. Readback
+/// must confirm the stopped descriptor before the caller may assert RUN.
+/// Stream0 means unassigned, not a playable converter binding.
+pub fn prepareStoppedControl(hw: anytype, expected: u32) bool {
+    const run: u32 = 1 << 1;
+    const reset: u32 = 1;
+    const binding_mask: u32 = (0xf << 20) | (1 << 19);
+    if (expected & ~binding_mask != 0 or expected & (0xf << 20) == 0) return false;
+    if (hw.readControl() & (run | reset) != 0) return false;
+    hw.writeControl(expected);
+    const confirmed = hw.readControl();
+    return confirmed & (run | reset) == 0 and confirmed & binding_mask == expected;
+}
+
+test "late codec binding is prepared while stopped and unconfirmed control cannot start" {
+    const Fake = struct {
+        value: u32,
+        writes: usize = 0,
+        ignore_write: bool = false,
+        pub fn readControl(self: *@This()) u32 { return self.value; }
+        pub fn writeControl(self: *@This(), value: u32) void {
+            std.debug.assert(self.value & 3 == 0);
+            std.debug.assert(value & 3 == 0);
+            self.writes += 1;
+            if (!self.ignore_write) self.value = value;
+        }
+    };
+    var late = Fake{ .value = 0 };
+    try std.testing.expect(prepareStoppedControl(&late, 0x100000));
+    try std.testing.expectEqual(@as(u32, 0x100000), late.value);
+    try std.testing.expectEqual(@as(usize, 1), late.writes);
+    var warm = Fake{ .value = 0x100000 };
+    try std.testing.expect(prepareStoppedControl(&warm, 0x100000));
+    var ignored = Fake{ .value = 0, .ignore_write = true };
+    try std.testing.expect(!prepareStoppedControl(&ignored, 0x100000));
+    var running = Fake{ .value = 0x100002 };
+    try std.testing.expect(!prepareStoppedControl(&running, 0x200000));
+    try std.testing.expectEqual(@as(usize, 0), running.writes);
+    var resetting = Fake{ .value = 1 };
+    try std.testing.expect(!prepareStoppedControl(&resetting, 0x100000));
+    try std.testing.expectEqual(@as(usize, 0), resetting.writes);
+    var unused = Fake{ .value = 0 };
+    try std.testing.expect(!prepareStoppedControl(&unused, 0));
+    try std.testing.expect(!prepareStoppedControl(&unused, 0x100002));
+    try std.testing.expectEqual(@as(usize, 0), unused.writes);
+    var bidi = Fake{ .value = 0 };
+    try std.testing.expect(prepareStoppedControl(&bidi, 0x180000));
 }

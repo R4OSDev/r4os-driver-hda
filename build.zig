@@ -43,6 +43,13 @@ pub fn build(b: *std.Build) void {
     const controller_reset_tests = b.addTest(.{ .root_module = controller_reset_tests_module });
     const run_controller_reset_tests = b.addRunArtifact(controller_reset_tests);
 
+    const coherency_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/dma_coherency.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const run_coherency_tests = b.addRunArtifact(coherency_tests);
+
     const command_ring_tests_module = b.createModule(.{
         .root_source_file = b.path("src/command_ring.zig"),
         .target = b.graph.host,
@@ -105,6 +112,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_work_gate_tests.step);
     test_step.dependOn(&run_controller_policy_tests.step);
     test_step.dependOn(&run_controller_reset_tests.step);
+    test_step.dependOn(&run_coherency_tests.step);
     test_step.dependOn(&run_command_ring_tests.step);
     test_step.dependOn(&run_codec_inventory_tests.step);
     test_step.dependOn(&run_codec_topology_tests.step);
