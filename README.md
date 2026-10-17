@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.39`
+- Version: `0.3.40`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
