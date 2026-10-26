@@ -14,6 +14,7 @@ const stream_hardware = @import("stream_hardware.zig");
 const irq_recovery = @import("irq_recovery.zig");
 const lifecycle = @import("lifecycle.zig");
 const hdmi = @import("hdmi.zig");
+const output_snapshot = @import("output_snapshot.zig");
 const amd_hdmi = @import("amd_hdmi.zig");
 
 comptime {
@@ -330,6 +331,27 @@ const State = struct {
     output_count: usize = 0,
     active_output_index: i32 = -1,
     output_poll_tick: u64 = 0,
+    // Control alone owns codec transport and raw observations. The stream
+    // owner publishes a complete checked catalog, never pending ELD bytes.
+    control_snapshot: output_snapshot.Snapshot = .{},
+    published_snapshot_generation: u64 = 1,
+    control_cursor: usize = 0,
+    control_result_ready: bool = false,
+    control_lock: bool = false,
+    control_pending: bool = false,
+    control_wait_owner: bool = false,
+    control_wait_stream: bool = false,
+    control_quiescing: bool = false,
+    control_io_active: bool = false,
+    route_transition: bool = false,
+    control_polls: u64 = 0,
+    control_publications: u64 = 0,
+    control_invalidations: u64 = 0,
+    pcm_during_control: u64 = 0,
+    refill_during_control: u64 = 0,
+    refill_contended: u64 = 0,
+    refill_release_wakes: u64 = 0,
+    refill_waiting: bool = false,
     display_audio: ?r4os.driver_outputs.Context = null,
     display_audio_managed: bool = false,
     // Temporary 0.82.37 diagnosis: at most one ELD failure per physical pin.
@@ -501,7 +523,7 @@ const State = struct {
     irq_generation: u64 = 0,
     work_pending: bool = false,
     synchronous_stop: bool = false,
-    work_handles: [WORK_HANDLE_CAPACITY]u32 = .{0} ** WORK_HANDLE_CAPACITY,
+    work_handles: [WORK_HANDLE_CAPACITY + 4]u32 = .{0} ** (WORK_HANDLE_CAPACITY + 4),
     completion_reap_gate: irq_recovery.ReapGate = .{},
     stream_lock: bool = false,
     recovery_latch: irq_recovery.RecoveryLatch = .{},
@@ -579,7 +601,9 @@ fn initController(state: *State, api: *const r4os.r4dev.DriverApi, info: r4os.ab
         ctx.logError("HDA.R4D driver api mismatch");
         return -10;
     }
-    if (ctx.graphicsOutputs()) |outputs| if (outputs.supportsAudio()) { state.display_audio = outputs; };
+    if (ctx.graphicsOutputs()) |outputs| if (outputs.supportsAudio()) {
+        state.display_audio = outputs;
+    };
 
     if (!initializeControllerCandidate(state, &ctx, info)) {
         ctx.logError("HDA.R4D controller initialization failed");
@@ -628,6 +652,7 @@ fn initController(state: *State, api: *const r4os.r4dev.DriverApi, info: r4os.ab
 
     state.stage = .ready;
     state.initialized = true;
+    captureControllerEvidence(state);
     logPlaybackReady(state, &ctx);
     logDiagnosticCore(state, &ctx);
     logDiagnosticRuntime(state, &ctx, "ready");
@@ -729,13 +754,20 @@ fn logCoherency(state: *State, ctx: *const r4os.r4dev.DriverContext, phase: []co
     const observed = state.coherency.observed orelse return;
     var line: [240:0]u8 = undefined;
     var len: usize = 0;
-    appendText(&line, &len, "HDA.COH "); appendText(&line, &len, phase);
-    appendText(&line, &len, " pci="); appendDec(&line, &len, state.info.bus);
-    appendText(&line, &len, ":"); appendDec(&line, &len, state.info.device);
-    appendText(&line, &len, "."); appendDec(&line, &len, state.info.function);
-    appendText(&line, &len, " cfg="); appendHex(&line, &len, state.coherency.offset, 4);
-    appendText(&line, &len, " before="); appendHex(&line, &len, original, 8);
-    appendText(&line, &len, " after="); appendHex(&line, &len, observed, 8);
+    appendText(&line, &len, "HDA.COH ");
+    appendText(&line, &len, phase);
+    appendText(&line, &len, " pci=");
+    appendDec(&line, &len, state.info.bus);
+    appendText(&line, &len, ":");
+    appendDec(&line, &len, state.info.device);
+    appendText(&line, &len, ".");
+    appendDec(&line, &len, state.info.function);
+    appendText(&line, &len, " cfg=");
+    appendHex(&line, &len, state.coherency.offset, 4);
+    appendText(&line, &len, " before=");
+    appendHex(&line, &len, original, 8);
+    appendText(&line, &len, " after=");
+    appendHex(&line, &len, observed, 8);
     logLine(ctx, &line, len);
 }
 
@@ -790,17 +822,17 @@ fn clearControllerCandidateState(state: *State) void {
     state.codec_mask = 0;
     state.codec_count = 0;
     state.discovered_codec_count = 0;
-    state.command_count = 0;
-    state.response_count = 0;
-    state.unsolicited_response_count = 0;
-    state.mismatched_response_count = 0;
-    state.timeout_count = 0;
+    @atomicStore(u64, &state.command_count, 0, .release);
+    @atomicStore(u64, &state.response_count, 0, .release);
+    @atomicStore(u64, &state.unsolicited_response_count, 0, .release);
+    @atomicStore(u64, &state.mismatched_response_count, 0, .release);
+    @atomicStore(u64, &state.timeout_count, 0, .release);
     state.reset_requested = false;
     state.reset_done = false;
     state.transport_ready = false;
     state.transport_mode = .none;
-    state.transport_fallback_count = 0;
-    state.transport_error_count = 0;
+    @atomicStore(u64, &state.transport_fallback_count, 0, .release);
+    @atomicStore(u64, &state.transport_error_count, 0, .release);
     state.corb = .{};
     state.rirb = .{};
     state.corb_entries = 0;
@@ -860,12 +892,12 @@ fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     if (!wait8ClearTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_DMA_STOP_TIMEOUT_MS) or
         !wait8ClearTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_DMA_STOP_TIMEOUT_MS))
     {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
     write32(base + REG_GCTL, read32(base + REG_GCTL) & ~GCTL_CRST);
     if (!wait32ClearTimed(ctx, base + REG_GCTL, GCTL_CRST, RESET_TIMEOUT_MS)) {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
     // HDA 1.0a requires CRST low for at least 100 microseconds.  One R4OS
@@ -873,7 +905,7 @@ fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     ctx.waitTicks(1);
     write32(base + REG_GCTL, read32(base + REG_GCTL) | GCTL_CRST);
     if (!wait32SetTimed(ctx, base + REG_GCTL, GCTL_CRST, RESET_TIMEOUT_MS)) {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
     write32(base + REG_INTCTL, 0);
@@ -892,7 +924,7 @@ fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     state.codec_mask = codec_mask;
     state.codec_count = countBits16(codec_mask);
     if (codec_mask == 0) {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         ctx.logError("HDA.R4D STATESTS codec wake timeout");
         return false;
     }
@@ -915,7 +947,7 @@ fn setupCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext) bo
                 logTransport(state, ctx, codec, response);
                 return true;
             }
-            state.transport_error_count +%= 1;
+            _ = @atomicRmw(u64, &state.transport_error_count, .Add, 1, .monotonic);
         }
         if (!shutdownCommandTransport(state, ctx)) return false;
     }
@@ -925,14 +957,14 @@ fn setupCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext) bo
         ctx.logError("HDA.R4D CORB/RIRB unavailable; Immediate fallback not enabled");
         return false;
     }
-    state.transport_fallback_count +%= 1;
+    _ = @atomicRmw(u64, &state.transport_fallback_count, .Add, 1, .monotonic);
     ctx.logWarn("HDA.R4D using explicitly enabled Immediate fallback");
     if (setupImmediateTransport(state, ctx, codec)) |response| {
         state.transport_ready = true;
         logTransport(state, ctx, codec, response);
         return true;
     }
-    state.transport_error_count +%= 1;
+    _ = @atomicRmw(u64, &state.transport_error_count, .Add, 1, .monotonic);
     return false;
 }
 
@@ -943,7 +975,7 @@ fn setupCorbRirb(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     if (!wait8ClearTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_DMA_STOP_TIMEOUT_MS) or
         !wait8ClearTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_DMA_STOP_TIMEOUT_MS))
     {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
 
@@ -990,12 +1022,12 @@ fn setupCorbRirb(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     write16(base + REG_CORBRP, CORBRP_RESET);
     if ((read16(base + REG_CORBRP) & CORBRP_RESET) != 0) write16(base + REG_CORBRP, 0);
     if (!wait16ClearTimed(ctx, base + REG_CORBRP, CORBRP_RESET, COMMAND_TIMEOUT_MS)) {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
     write16(base + REG_RIRBWP, RIRBWP_RESET);
     if (!wait16ValueTimed(ctx, base + REG_RIRBWP, 0x00FF, 0, COMMAND_TIMEOUT_MS)) {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
     write16(base + REG_RINTCNT, 1);
@@ -1010,7 +1042,7 @@ fn setupCorbRirb(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     if (!wait8SetTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_TIMEOUT_MS) or
         !wait8SetTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_TIMEOUT_MS))
     {
-        state.timeout_count +%= 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return false;
     }
     state.transport_mode = .corb_rirb;
@@ -1030,7 +1062,7 @@ fn shutdownCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext)
         if (!wait8ClearTimed(ctx, base + REG_RIRBCTL, RIRBCTL_DMA_ENABLE, COMMAND_DMA_STOP_TIMEOUT_MS) or
             !wait8ClearTimed(ctx, base + REG_CORBCTL, CORBCTL_RUN, COMMAND_DMA_STOP_TIMEOUT_MS))
         {
-            state.timeout_count +%= 1;
+            _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
             return false;
         }
         write8(base + REG_CORBSTS, CORBSTS_MEMORY_ERROR);
@@ -1272,6 +1304,8 @@ fn chooseOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext) vo
         }
     }
 
+    for (state.output_catalog[0..state.output_count], 0..) |candidate, index|
+        state.control_snapshot.sinks[index] = candidate.sink;
     rejectAmbiguousDisplayPins(state);
     state.output_routes[outputRouteIndex(.hdmi)] = .{};
     for (state.output_catalog[0..state.output_count]) |candidate| if (candidate.role == .hdmi and candidate.sink.availability == .ready) {
@@ -1358,7 +1392,11 @@ fn amdDisplayCodec(state: *const State, codec: u8) bool {
         amd_hdmi.supported(state.codecs[codec].vendor_id, state.codecs[codec].revision_id);
 }
 const AmdSinkReader = struct {
-    state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, deadline: u64,
+    state: *State,
+    ctx: *const r4os.r4dev.DriverContext,
+    codec: u8,
+    pin: u8,
+    deadline: u64,
     pub fn verb(self: *const @This(), command: u16, value: u8) ?u32 {
         if (self.ctx.tickCount() >= self.deadline) return null;
         return sendVerb(self.state, makeVerb(self.codec, self.pin, command, value));
@@ -1369,8 +1407,7 @@ fn readAmdSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, p
     // AMD has no standard ELD byte reader. Never trust firmware-only pin
     // presence without this exact driver/source generation and vendor readback.
     state.display_audio_managed = true;
-    const reader = AmdSinkReader{ .state = state, .ctx = ctx, .codec = codec, .pin = pin,
-        .deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS) };
+    const reader = AmdSinkReader{ .state = state, .ctx = ctx, .codec = codec, .pin = pin, .deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS) };
     for (0..r4os.abi.gfx_output_catalog_capacity) |i| {
         var route: r4os.abi.GfxAudioRoute = .{};
         if (outputs.queryAudio(location, device, @intCast(i), &route) != 1) break;
@@ -1563,13 +1600,15 @@ fn executeOutputOperation(state: *State, ctx: *const r4os.r4dev.DriverContext, c
         .set_digital => sendVerb(state, makeVerb(codec, operation.node, 0x70d, @truncate(operation.value))) != null,
         .set_channel_count => sendVerb(state, makeVerb(codec, operation.node, 0x72d, @truncate(operation.value))) != null,
         .set_amd_allocation, .set_amd_downmix, .set_amd_remap, .set_amd_ramp, .set_amd_slot, .clear_amd_hbr => blk: {
-            const reader = AmdSinkReader{ .state = state, .ctx = ctx, .codec = codec, .pin = operation.node,
-                .deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS) };
+            const reader = AmdSinkReader{ .state = state, .ctx = ctx, .codec = codec, .pin = operation.node, .deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS) };
             if (operation.kind == .clear_amd_hbr) break :blk amd_hdmi.pcmMode(&reader);
             const verb: u16 = switch (operation.kind) {
-                .set_amd_allocation => amd_hdmi.set_allocation, .set_amd_downmix => amd_hdmi.set_downmix,
-                .set_amd_remap => amd_hdmi.set_remap, .set_amd_ramp => amd_hdmi.set_ramp,
-                .set_amd_slot => amd_hdmi.slotVerb(@intCast(operation.value)), else => unreachable,
+                .set_amd_allocation => amd_hdmi.set_allocation,
+                .set_amd_downmix => amd_hdmi.set_downmix,
+                .set_amd_remap => amd_hdmi.set_remap,
+                .set_amd_ramp => amd_hdmi.set_ramp,
+                .set_amd_slot => amd_hdmi.slotVerb(@intCast(operation.value)),
+                else => unreachable,
             };
             const value: u8 = if (operation.kind == .set_amd_slot) amd_hdmi.slotValue(@intCast(operation.value), true) else @truncate(operation.value);
             break :blk amd_hdmi.program(&reader, verb, value);
@@ -1649,6 +1688,14 @@ fn pollJackAndSwitch(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
         return;
     }
     const candidate = state.output_routes[outputRouteIndex(role)];
+    if (!acquireStream(state, ctx, 100)) return;
+    if (!stopPlayback(state, ctx, true)) {
+        releaseStream(state);
+        return;
+    }
+    @atomicStore(bool, &state.route_transition, true, .release);
+    releaseStream(state);
+    defer @atomicStore(bool, &state.route_transition, false, .release);
     if (switchOutputCandidate(state, ctx, candidate)) {
         state.jack_sense = sense;
         logJackPolicy(state, ctx);
@@ -1836,7 +1883,7 @@ const StoppedStreamControl = struct {
 fn prepareStreamStartControl(state: *State) bool {
     var control = StoppedStreamControl{ .state = state };
     if (stream_hardware.prepareStoppedControl(&control, streamControlBase(state))) return true;
-    state.error_count += 1;
+    _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
     state.last_error = "stopped stream binding unconfirmed";
     state.output_path_ok = false;
     const ctx = context(state);
@@ -2023,11 +2070,13 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
 }
 
 fn scheduleRefillWork(s: *State) void {
+    if (@atomicLoad(bool, &s.control_quiescing, .acquire)) return;
     if (!work_gate.maySchedule(&s.shutting_down, &s.synchronous_stop)) return;
     if (@atomicRmw(bool, &s.work_pending, .Xchg, true, .acq_rel)) return;
+    @atomicStore(bool, &s.refill_waiting, false, .release);
     const ctx = r4os.r4dev.DriverContext.init(s.api);
     var free_index: ?usize = null;
-    for (&s.work_handles, 0..) |*handle, index| {
+    for (s.work_handles[0..WORK_HANDLE_CAPACITY], 0..) |*handle, index| {
         if (@atomicLoad(u32, handle, .acquire) == 0) {
             free_index = index;
             break;
@@ -2070,6 +2119,9 @@ fn refillWork(raw_context: usize) callconv(.c) i32 {
         if (tryAcquireStream(state)) {
             defer releaseStream(state);
             completed = true;
+            if (@atomicLoad(bool, &s.route_transition, .acquire)) return finishRefillTransition(s);
+            const overlapping_control = @atomicLoad(bool, &s.control_io_active, .acquire);
+            const refills_before = s.refill_count;
             const status_bits = s.recovery_latch.take();
             if (status_bits != 0) {
                 const reason: [*:0]const u8 = if ((status_bits & SD_STS_DESE) != 0 and (status_bits & SD_STS_FIFOE) != 0)
@@ -2086,9 +2138,22 @@ fn refillWork(raw_context: usize) callconv(.c) i32 {
                 fillDmaPeriods(state, &ctx);
                 startPlaybackIfNeeded(state);
             }
+            if (overlapping_control and s.refill_count != refills_before)
+                _ = @atomicRmw(u64, &s.refill_during_control, .Add, 1, .monotonic);
         }
     }
-    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, &s.synchronous_stop, completed) == .resubmit) scheduleRefillWork(s);
+    const finish = if (completed)
+        work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, &s.synchronous_stop, true)
+    else blk: {
+        _ = @atomicRmw(u64, &s.refill_contended, .Add, 1, .monotonic);
+        break :blk work_gate.parkContended(&s.work_pending, &s.refill_waiting, &s.stream_lock, &s.irq_generation, observed_generation, &s.shutting_down, &s.synchronous_stop);
+    };
+    if (finish == .resubmit) scheduleRefillWork(s);
+    return 0;
+}
+
+fn finishRefillTransition(state: *State) i32 {
+    @atomicStore(bool, &state.work_pending, false, .release);
     return 0;
 }
 
@@ -2109,6 +2174,8 @@ fn releaseCompletedWork(state: *State, ctx: *const r4os.r4dev.DriverContext, rea
 }
 
 fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+    @atomicStore(bool, &state.control_quiescing, true, .release);
+    defer @atomicStore(bool, &state.control_quiescing, false, .release);
     @atomicStore(bool, &state.work_pending, false, .release);
     const gate_deadline = ctx.tickCount() +| msTicks(ctx, 100);
     while (!state.completion_reap_gate.tryClaim(.task)) {
@@ -2135,6 +2202,14 @@ fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         }
     }
     syncWorkOwnership(state);
+    if (quiesced) {
+        // Cancelled queued callbacks never run their pending epilogue. Clear
+        // claims only after the actual handles have joined and been released.
+        @atomicStore(bool, &state.control_pending, false, .release);
+        @atomicStore(bool, &state.control_wait_owner, false, .release);
+        @atomicStore(bool, &state.control_wait_stream, false, .release);
+        @atomicStore(bool, &state.refill_waiting, false, .release);
+    }
     return quiesced;
 }
 
@@ -2176,7 +2251,7 @@ fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) 
     const rc = ctx.registerAudioOutputIdle(&state.backend_name, &state.backend);
     state.last_result = rc;
     if (rc != 0) {
-        state.error_count += 1;
+        _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
         return false;
     }
     state.backend_registered = true;
@@ -2199,26 +2274,129 @@ fn acceptsPcmInput(rate: u32, channels: u16, format: u16) bool {
 }
 
 fn refreshOutputs(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    const now = ctx.tickCount();
-    if (now < state.output_poll_tick) return;
-    state.output_poll_tick = now +| msTicks(ctx, JACK_POLL_MS);
-    for (state.output_catalog[0..state.output_count]) |*candidate| {
-        if (candidate.role != .hdmi) continue;
-        const sink = readHdmiSink(state, ctx, candidate.codec, candidate.pin);
-        if (sink.availability != candidate.sink.availability) logHdmiSink(state, ctx, candidate.codec, candidate.pin, sink);
-        candidate.sink = sink;
+    if (ctx.tickCount() < @atomicLoad(u64, &state.output_poll_tick, .acquire)) return;
+    scheduleControlWork(state);
+}
+
+fn scheduleControlWork(state: *State) void {
+    if (!@atomicLoad(bool, &state.present, .acquire) or
+        @atomicLoad(bool, &state.shutting_down, .acquire) or
+        @atomicLoad(bool, &state.control_quiescing, .acquire)) return;
+    if (@atomicRmw(bool, &state.control_pending, .Xchg, true, .acq_rel)) return;
+    @atomicStore(bool, &state.control_wait_owner, false, .release);
+    @atomicStore(bool, &state.control_wait_stream, false, .release);
+    const ctx = context(state);
+    for (state.work_handles[WORK_HANDLE_CAPACITY..]) |*stored| {
+        if (@atomicLoad(u32, stored, .acquire) != 0) continue;
+        var handle: u32 = 0;
+        // Generic task work has its existing r4d-work worker. It must not use
+        // workSubmitRequest: that API is exclusively the audio-deadline lane.
+        if (ctx.workSubmit(controlWork, @intFromPtr(state), 0, &handle) != 0 or handle == 0) break;
+        @atomicStore(u32, stored, handle, .release);
+        state.lifecycle.acquireAtomic(.work);
+        return;
     }
-    rejectAmbiguousDisplayPins(state);
+    @atomicStore(bool, &state.control_pending, false, .release);
+}
+
+fn acquireControl(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+    const deadline = ctx.tickCount() +| msTicks(ctx, 100);
+    while (@atomicRmw(bool, &state.control_lock, .Xchg, true, .acq_rel)) {
+        if (ctx.tickCount() >= deadline) return false;
+        ctx.waitTicks(1);
+    }
+    return true;
+}
+
+fn releaseControl(state: *State) void {
+    @atomicStore(bool, &state.control_lock, false, .release);
+    if (@atomicLoad(bool, &state.control_wait_owner, .acquire)) scheduleControlWork(state);
+}
+
+fn finishControlWork(state: *State) void {
+    // Wait flags remain set if an unlock encounters pending still claimed.
+    // Recheck both owners after dropping pending to close that lost-wake race.
+    @atomicStore(bool, &state.control_pending, false, .release);
+    if ((@atomicLoad(bool, &state.control_wait_owner, .acquire) and !@atomicLoad(bool, &state.control_lock, .acquire)) or
+        (@atomicLoad(bool, &state.control_wait_stream, .acquire) and !@atomicLoad(bool, &state.stream_lock, .acquire)))
+        scheduleControlWork(state);
+}
+
+fn controlWork(raw: usize) callconv(.c) i32 {
+    const state: *State = @ptrFromInt(raw);
+    const ctx = context(state);
+    releaseCompletedWork(state, &ctx, .worker);
+    defer finishControlWork(state);
+    if (@atomicLoad(bool, &state.shutting_down, .acquire)) return 0;
+    if (@atomicRmw(bool, &state.control_lock, .Xchg, true, .acq_rel)) {
+        @atomicStore(bool, &state.control_wait_owner, true, .release);
+        return 0;
+    }
+    defer releaseControl(state);
+    if (!state.control_result_ready) {
+        // One physical pin (one existing bounded ELD read) per callback.
+        // The next producer/query advances the remaining finite sweep; there
+        // is no timer thread, periodic scan or immediate control retry loop.
+        @atomicStore(bool, &state.control_io_active, true, .release);
+        var index = state.control_cursor;
+        while (index < state.output_count and state.output_catalog[index].role != .hdmi) : (index += 1) {}
+        if (index < state.output_count) {
+            const candidate = state.output_catalog[index];
+            const sink = readHdmiSink(state, &ctx, candidate.codec, candidate.pin);
+            if (sink.availability != state.control_snapshot.sinks[index].availability)
+                logHdmiSink(state, &ctx, candidate.codec, candidate.pin, sink);
+            state.control_snapshot.observe(index, sink);
+            state.control_cursor = index + 1;
+            _ = @atomicRmw(u64, &state.control_polls, .Add, 1, .monotonic);
+        } else state.control_cursor = state.output_count;
+        @atomicStore(bool, &state.control_io_active, false, .release);
+        state.control_result_ready = true;
+    }
+    if (!publishControlSnapshot(state, &ctx)) {
+        @atomicStore(bool, &state.control_wait_stream, true, .release);
+        return 0;
+    }
+    state.control_result_ready = false;
+    var next = state.control_cursor;
+    while (next < state.output_count and state.output_catalog[next].role != .hdmi) : (next += 1) {}
+    if (next >= state.output_count) {
+        // Analog jack sensing also belongs to the codec control owner. A
+        // real route change first stops DMA, then drops the stream lock.
+        pollJackAndSwitch(state, &ctx);
+        state.control_cursor = 0;
+        @atomicStore(u64, &state.output_poll_tick, ctx.tickCount() +| msTicks(&ctx, JACK_POLL_MS), .release);
+    }
+    return 0;
+}
+
+fn publishControlSnapshot(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+    if (!tryAcquireStream(state)) return false;
+    for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| {
+        if (candidate.role == .hdmi) candidate.sink = state.control_snapshot.checked(index, state.output_count);
+    }
+    state.published_snapshot_generation = state.control_snapshot.generation;
+    _ = @atomicRmw(u64, &state.control_publications, .Add, 1, .monotonic);
     const active = @atomicLoad(i32, &state.active_output_index, .acquire);
+    var revoke: ?OutputCandidate = null;
     if (active >= 0 and active < state.output_count) {
         const candidate = state.output_catalog[@intCast(active)];
-        if (candidate.role == .hdmi and (candidate.sink.availability != .ready or !hdmi.sameReceiver(candidate.sink, state.output.sink))) {
+        if (candidate.role == .hdmi and output_snapshot.invalidates(state.output.sink, candidate.sink)) {
+            // Actual hotplug invalidates the complete published route before
+            // any caller can accept PCM against its old receiver generation.
             _ = stopPlayback(state, ctx, false);
-            _ = deactivateOutputCandidate(state, state.output);
+            @atomicStore(bool, &state.route_transition, true, .release);
             state.output_path_ok = false;
             @atomicStore(i32, &state.active_output_index, -1, .release);
+            revoke = state.output;
+            _ = @atomicRmw(u64, &state.control_invalidations, .Add, 1, .monotonic);
         }
     }
+    releaseStream(state);
+    if (revoke) |candidate| {
+        _ = deactivateOutputCandidate(state, candidate);
+        @atomicStore(bool, &state.route_transition, false, .release);
+    }
+    return true;
 }
 fn rejectAmbiguousDisplayPins(state: *State) void {
     var ambiguous: [32]bool = @splat(false);
@@ -2226,11 +2404,14 @@ fn rejectAmbiguousDisplayPins(state: *State) void {
         if (candidate.role != .hdmi or candidate.sink.availability != .ready) continue;
         for (state.output_catalog[0..index], 0..) |previous, prior| {
             if (previous.role == .hdmi and previous.sink.availability == .ready and hdmi.sameDisplayPort(previous.sink, candidate.sink)) {
-                ambiguous[prior] = true; ambiguous[index] = true;
+                ambiguous[prior] = true;
+                ambiguous[index] = true;
             }
         }
     }
-    for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| if (ambiguous[index]) { candidate.sink.availability = .invalid_eld; };
+    for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| if (ambiguous[index]) {
+        candidate.sink.availability = .invalid_eld;
+    };
 }
 
 fn outputAvailability(candidate: OutputCandidate) u32 {
@@ -2248,10 +2429,11 @@ fn queryOutput(raw: u64, index: u32, out: *r4os.abi.AudioOutputInfo) callconv(.c
     const state: *State = @ptrFromInt(raw);
     out.* = .{};
     if (index >= state.output_count) return 0;
+    const ctx = context(state);
+    releaseCompletedWork(state, &ctx, .task);
+    refreshOutputs(state, &ctx);
     if (!tryAcquireStream(state)) return r4os.abi.service_api_result_busy;
     defer releaseStream(state);
-    const ctx = context(state);
-    refreshOutputs(state, &ctx);
     const candidate = state.output_catalog[index];
     var len: usize = 0;
     appendText(&out.id, &len, "HDA-");
@@ -2283,7 +2465,7 @@ fn queryOutput(raw: u64, index: u32, out: *r4os.abi.AudioOutputInfo) callconv(.c
     out.kind = @intFromEnum(candidate.role);
     if (candidate.sink.display_port) out.kind = r4os.abi.audio_output_kind_display_port;
     out.availability = if (state.initialized) outputAvailability(candidate) else r4os.abi.audio_output_failed;
-    if (@atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index))) out.flags = r4os.abi.audio_output_flag_active;
+    if (!@atomicLoad(bool, &state.route_transition, .acquire) and @atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index))) out.flags = r4os.abi.audio_output_flag_active;
     out.preferred_rate = pcm.TARGET_RATE;
     out.channels = pcm.TARGET_CHANNELS;
     out.format = pcm.FORMAT_S16LE;
@@ -2294,19 +2476,41 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
     const state: *State = @ptrFromInt(raw);
     if (index >= state.output_count or !state.initialized) return -1;
     const ctx = context(state);
+    if (!acquireControl(state, &ctx)) return r4os.abi.service_api_result_busy;
+    defer releaseControl(state);
+    const previous = state.output_catalog[index];
+    if (previous.role == .hdmi) {
+        // Explicit selection verifies this physical pin now, outside the
+        // stream owner. Codec programming below verifies it again as before.
+        state.control_snapshot.observe(index, readHdmiSink(state, &ctx, previous.codec, previous.pin));
+        if (!publishControlSnapshot(state, &ctx)) return r4os.abi.service_api_result_busy;
+    }
     if (!acquireStream(state, &ctx, 100)) return r4os.abi.service_api_result_busy;
-    defer releaseStream(state);
-    refreshOutputs(state, &ctx);
     const candidate = state.output_catalog[index];
-    if (outputAvailability(candidate) != r4os.abi.audio_output_available) return -1;
+    if (outputAvailability(candidate) != r4os.abi.audio_output_available) {
+        releaseStream(state);
+        return -1;
+    }
     if (@atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index)) and state.output_path_ok) {
         state.explicit_output = true;
-        return if (prepareSelectedCarrier(state)) 0 else -1;
+        const ready = prepareSelectedCarrier(state);
+        releaseStream(state);
+        return if (ready) 0 else -1;
     }
-    if (!stopPlayback(state, &ctx, true)) return -1;
-    // Keep the previous route available for rollback. No PCI discovery,
-    // mapping, MSI allocation or driver reinitialization occurs here.
-    if (!switchOutputCandidate(state, &ctx, candidate)) return -1;
+    if (!stopPlayback(state, &ctx, true)) {
+        releaseStream(state);
+        return -1;
+    }
+    @atomicStore(bool, &state.route_transition, true, .release);
+    releaseStream(state);
+    const switched = switchOutputCandidate(state, &ctx, candidate);
+    if (!acquireStream(state, &ctx, 100)) {
+        @atomicStore(bool, &state.route_transition, false, .release);
+        return r4os.abi.service_api_result_busy;
+    }
+    defer releaseStream(state);
+    defer @atomicStore(bool, &state.route_transition, false, .release);
+    if (!switched) return -1;
     state.lifecycle.acquireAtomic(.route);
     state.explicit_output = true;
     return if (prepareSelectedCarrier(state)) 0 else -1;
@@ -2314,6 +2518,7 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
 
 fn activeOutput(raw: u64) callconv(.c) i32 {
     const state: *State = @ptrFromInt(raw);
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) return -1;
     return @atomicLoad(i32, &state.active_output_index, .acquire);
 }
 
@@ -2327,14 +2532,16 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
         return finishWrite(state, -1, write_start);
     }
     releaseCompletedWork(state, &ctx, .task);
+    refreshOutputs(state, &ctx);
     if (!acquireStream(state, &ctx, 100)) return finishWrite(state, -6, write_start);
     defer releaseStream(state);
     if (@atomicLoad(bool, &state.shutting_down, .acquire)) {
         logWriteRejectOnce(state, &ctx);
         return finishWrite(state, -1, write_start);
     }
-    pollJackAndSwitch(state, &ctx);
-    refreshOutputs(state, &ctx);
+    if (@atomicLoad(bool, &state.route_transition, .acquire))
+        return finishWrite(state, r4os.abi.service_api_result_busy, write_start);
+    const overlapping_control = @atomicLoad(bool, &state.control_io_active, .acquire);
     if (!state.output_path_ok) return finishWrite(state, -1, write_start);
     // Initial automatic selection and a recovered stream can reach Write
     // without an explicit output-selection callback. Prime an empty HDMI
@@ -2405,19 +2612,26 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
         state.start_due_tick = state.last_pcm_tick +| msTicks(&ctx, 10);
     fillDmaPeriods(state, &ctx);
     startPlaybackIfNeeded(state);
+    if (overlapping_control) _ = @atomicRmw(u64, &state.pcm_during_control, .Add, 1, .monotonic);
     return finishWrite(state, 0, write_start);
 }
 
 fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) return r4os.abi.service_api_result_busy;
     var ctx = context(state);
     if (!acquireStream(state, &ctx, 100)) return setLastResult(state, -1);
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) {
+        releaseStream(state);
+        return r4os.abi.service_api_result_busy;
+    }
     const drained = stopPlayback(state, &ctx, true);
     const decision = lifecycle.stopDecision(if (drained) .drained else .timeout);
     const stopped = drained or (decision.force_drop and stopPlayback(state, &ctx, false));
     releaseStream(state);
     if (!stopped) return setLastResult(state, -1);
     if (!releaseDriverWork(state, &ctx)) return setLastResult(state, -1);
+    logControlSummary(state, &ctx);
     logControllerSelectionEvidence(state, &ctx);
     logDiagnosticCore(state, &ctx);
     logDiagnosticRuntime(state, &ctx, "close");
@@ -2427,9 +2641,16 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
 
 fn idlePlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
-    if (!carrierEligible(state)) return stopPlaybackBackend(context_arg);
     var ctx = context(state);
     if (!acquireStream(state, &ctx, 100)) return setLastResult(state, -1);
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) {
+        releaseStream(state);
+        return r4os.abi.service_api_result_busy;
+    }
+    if (!carrierEligible(state)) {
+        releaseStream(state);
+        return stopPlaybackBackend(context_arg);
+    }
     @atomicStore(bool, &state.synchronous_stop, true, .release);
     const drained = drainPlayback(state, &ctx);
     const quiet = drained and enterSilentCarrier(state);
@@ -2438,6 +2659,8 @@ fn idlePlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     @atomicStore(bool, &state.synchronous_stop, false, .release);
     releaseStream(state);
     if (!releaseDriverWork(state, &ctx)) return setLastResult(state, -1);
+    logControlSummary(state, &ctx);
+    logControllerSelectionEvidence(state, &ctx);
     logDiagnosticCore(state, &ctx);
     logDiagnosticRuntime(state, &ctx, "close");
     logIdleSummary(state, &ctx);
@@ -2510,15 +2733,41 @@ fn resumeCarrierPcm(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
+fn logControlSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+    var line: [240:0]u8 = undefined;
+    var len: usize = 0;
+    appendText(&line, &len, "HDA.CONTROL polls=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.control_polls, .acquire));
+    appendText(&line, &len, " published=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.control_publications, .acquire));
+    appendText(&line, &len, " revoked=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.control_invalidations, .acquire));
+    appendText(&line, &len, " pcm=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.pcm_during_control, .acquire));
+    appendText(&line, &len, " refill=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.refill_during_control, .acquire));
+    appendText(&line, &len, " parked=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.refill_contended, .acquire));
+    appendText(&line, &len, " wakes=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.refill_release_wakes, .acquire));
+    logLine(ctx, &line, len);
+}
+
 fn logCarrierSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     var line: [240:0]u8 = undefined;
     var len: usize = 0;
-    appendText(&line, &len, "HDA.CARRIER quiet="); appendDec(&line, &len, @intFromBool(@atomicLoad(bool, &state.silent_carrier, .acquire)));
-    appendText(&line, &len, " starts="); appendDec(&line, &len, state.carrier_starts);
-    appendText(&line, &len, " entries="); appendDec(&line, &len, state.carrier_entries);
-    appendText(&line, &len, " resumes="); appendDec(&line, &len, state.carrier_resumes);
-    appendText(&line, &len, " lead="); appendDec(&line, &len, state.carrier_lead_periods);
-    appendText(&line, &len, " ctl="); appendHex(&line, &len, read32(state.stream_desc_base + SD_CTL), 6);
+    appendText(&line, &len, "HDA.CARRIER quiet=");
+    appendDec(&line, &len, @intFromBool(@atomicLoad(bool, &state.silent_carrier, .acquire)));
+    appendText(&line, &len, " starts=");
+    appendDec(&line, &len, state.carrier_starts);
+    appendText(&line, &len, " entries=");
+    appendDec(&line, &len, state.carrier_entries);
+    appendText(&line, &len, " resumes=");
+    appendDec(&line, &len, state.carrier_resumes);
+    appendText(&line, &len, " lead=");
+    appendDec(&line, &len, state.carrier_lead_periods);
+    appendText(&line, &len, " ctl=");
+    appendHex(&line, &len, read32(state.stream_desc_base + SD_CTL), 6);
     logLine(ctx, &line, len);
 }
 
@@ -2530,28 +2779,25 @@ fn shutdownBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
 
 fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) callconv(.c) i32 {
     const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
-    // Status is also the producer's pacing observation. IRQ work can be
-    // delayed or coalesced under TCG, so refresh ownership directly from
-    // LPIB before publishing the ring fill. Never wait behind an active
-    // writer; the next status or IRQ job will observe the position instead.
-    var deferred = false;
+    out.* = .{};
+    const ctx = context(state);
+    releaseCompletedWork(state, &ctx, .task);
+    refreshOutputs(state, &ctx);
+    // Busy observations have no payload contract. Keep the actual status
+    // copy and route observation coherent under the existing stream owner.
+    if (!tryAcquireStream(state)) return r4os.abi.service_api_result_busy;
+    defer releaseStream(state);
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) return r4os.abi.service_api_result_busy;
     if (@atomicLoad(bool, &state.present, .acquire) and state.dma_ready) {
-        if (!tryAcquireStream(state)) {
-            deferred = true;
-        } else {
-            var ctx = context(state);
-            pollJackAndSwitch(state, &ctx);
-            refreshPlaybackPosition(state, &ctx);
-            fillDmaPeriods(state, &ctx);
-            startPlaybackIfNeeded(state);
-            releaseStream(state);
-        }
+        refreshPlaybackPosition(state, &ctx);
+        fillDmaPeriods(state, &ctx);
+        startPlaybackIfNeeded(state);
     }
     out.* = .{
-        .active = if (@atomicLoad(bool, &state.present, .acquire) and state.backend_registered and state.dma_ready and state.output_path_ok) 1 else 0,
+        .active = if (!@atomicLoad(bool, &state.route_transition, .acquire) and @atomicLoad(bool, &state.present, .acquire) and state.backend_registered and state.dma_ready and state.output_path_ok) 1 else 0,
         .writes = state.write_count,
         .underruns = state.underrun_count,
-        .errors = state.error_count + state.timeout_count + state.fifo_error_count + state.descriptor_error_count + state.position_recovery_count + state.queue_overflow_count + state.drain_timeout_count + state.refill_timeout_count + state.irq_work_dropped,
+        .errors = @atomicLoad(u64, &state.error_count, .acquire) + @atomicLoad(u64, &state.timeout_count, .acquire) + @atomicLoad(u64, &state.fifo_error_count, .acquire) + @atomicLoad(u64, &state.descriptor_error_count, .acquire) + state.position_recovery_count + state.queue_overflow_count + state.drain_timeout_count + state.refill_timeout_count + @atomicLoad(u64, &state.irq_work_dropped, .acquire),
         .last_result = state.last_result,
         .reserved = 0,
         .refills = state.refill_count,
@@ -2566,7 +2812,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
         .max_refill_ticks = state.refill_max_ticks,
         .total_refill_ticks = state.refill_total_ticks,
     };
-    return if (deferred) r4os.abi.service_api_result_busy else 0;
+    return 0;
 }
 
 fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
@@ -2720,7 +2966,7 @@ fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext) 
         if (commitTailPeriod(state)) {
             state.idle_tail_count +%= 1;
         } else {
-            state.error_count +%= 1;
+            _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
             state.last_error = "idle tail commit failed";
         }
     }
@@ -2735,7 +2981,7 @@ fn parkEmptyPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     // Stop DMA and completion IRQs before resetting ownership. Keep the
     // source queue and resampler phase belonging to the open logical stream.
     if (!resetStreamDescriptor(state, ctx)) {
-        state.error_count +%= 1;
+        _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
         _ = recoverStream(state, ctx, "idle descriptor reset failed");
         return false;
     }
@@ -2802,7 +3048,7 @@ fn recoverPositionFailure(
     }
     state.position_recovery_count +%= 1;
     state.last_error = reason;
-    if (!recoverStream(state, ctx, reason)) state.error_count +%= 1;
+    if (!recoverStream(state, ctx, reason)) _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
 }
 
 fn startPlaybackIfNeeded(state: *State) void {
@@ -2886,12 +3132,12 @@ fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool
     const control = read32(state.stream_desc_base + SD_CTL);
     write32(state.stream_desc_base + SD_CTL, control & ~SD_CTL_RUN);
     if (!waitRunClear(state, ctx)) {
-        state.error_count += 1;
+        _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
         return recoverStream(state, ctx, "stop timeout");
     }
     write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
     if (!resetStreamDescriptor(state, ctx)) {
-        state.error_count += 1;
+        _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
         noteHdaWarn(state, ctx, "stop descriptor reset failed");
     } else {
         clearStreamBuffers(state);
@@ -2941,6 +3187,8 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     @atomicStore(i32, &state.active_output_index, -1, .release);
     @atomicStore(bool, &state.shutting_down, true, .release);
     @atomicStore(bool, &state.present, false, .release);
+    if (!acquireControl(state, ctx)) return false;
+    defer releaseControl(state);
     const failed_stage = state.failed_stage;
     state.stage = .teardown;
 
@@ -2974,6 +3222,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         noteHdaWarn(state, ctx, "shutdown work quiesce failed");
         return false;
     }
+    logControlSummary(state, ctx);
     logDiagnosticRuntime(state, ctx, "shutdown");
     logPlaybackSummary(state, ctx);
     if (state.stream_desc_base != 0) {
@@ -3049,6 +3298,11 @@ fn acquireStream(state: *State, ctx: *const r4os.r4dev.DriverContext, timeout_ms
 
 fn releaseStream(state: *State) void {
     @atomicStore(bool, &state.stream_lock, false, .release);
+    if (@atomicLoad(bool, &state.refill_waiting, .acquire)) {
+        _ = @atomicRmw(u64, &state.refill_release_wakes, .Add, 1, .monotonic);
+        scheduleRefillWork(state);
+    }
+    if (@atomicLoad(bool, &state.control_wait_stream, .acquire)) scheduleControlWork(state);
 }
 
 fn dmaSlice(state: *State, index: usize) ?[]u8 {
@@ -3064,7 +3318,7 @@ fn dmaSlice(state: *State, index: usize) ?[]u8 {
 
 fn setLastResult(state: *State, result: i32) i32 {
     state.last_result = result;
-    if (result < 0 and result != r4os.abi.service_api_result_busy) state.error_count += 1;
+    if (result < 0 and result != r4os.abi.service_api_result_busy) _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
     return result;
 }
 
@@ -3125,11 +3379,11 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
     var next_wp = command_ring.next(state.corb_write_pointer, state.corb_entries);
     while (command_ring.isFull(state.corb_write_pointer, read16(base + REG_CORBRP) & 0x00FF, state.corb_entries)) {
         if (ctx.tickCount() >= deadline) {
-            state.timeout_count +%= 1;
+            _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
             return null;
         }
         if ((read8(base + REG_CORBSTS) & CORBSTS_MEMORY_ERROR) != 0) {
-            state.transport_error_count +%= 1;
+            _ = @atomicRmw(u64, &state.transport_error_count, .Add, 1, .monotonic);
             return null;
         }
         ctx.waitTicks(1);
@@ -3140,7 +3394,7 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
     corb[@intCast(next_wp)] = verb;
     dmaBarrier();
     state.corb_write_pointer = next_wp;
-    state.command_count +%= 1;
+    _ = @atomicRmw(u64, &state.command_count, .Add, 1, .monotonic);
     write16(base + REG_CORBWP, next_wp);
 
     // Give this solicited DMA response one bounded short polling burst before
@@ -3154,7 +3408,7 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
         if ((corb_status & CORBSTS_MEMORY_ERROR) != 0 or (rirb_status & RIRBSTS_OVERRUN) != 0) {
             if ((corb_status & CORBSTS_MEMORY_ERROR) != 0) write8(base + REG_CORBSTS, CORBSTS_MEMORY_ERROR);
             if ((rirb_status & RIRBSTS_OVERRUN) != 0) write8(base + REG_RIRBSTS, RIRBSTS_OVERRUN);
-            state.transport_error_count +%= 1;
+            _ = @atomicRmw(u64, &state.transport_error_count, .Add, 1, .monotonic);
             return null;
         }
 
@@ -3166,14 +3420,14 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
             const raw = rirb[@intCast(state.rirb_read_pointer)];
             const response = command_ring.decodeResponse(raw.response, raw.extended);
             if (response.unsolicited) {
-                state.unsolicited_response_count +%= 1;
+                _ = @atomicRmw(u64, &state.unsolicited_response_count, .Add, 1, .monotonic);
                 continue;
             }
             if (!command_ring.isMatchingSolicited(response, codec)) {
-                state.mismatched_response_count +%= 1;
+                _ = @atomicRmw(u64, &state.mismatched_response_count, .Add, 1, .monotonic);
                 continue;
             }
-            state.response_count +%= 1;
+            _ = @atomicRmw(u64, &state.response_count, .Add, 1, .monotonic);
             if ((rirb_status & RIRBSTS_RESPONSE) != 0) write8(base + REG_RIRBSTS, RIRBSTS_RESPONSE);
             return response.value;
         }
@@ -3185,32 +3439,32 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
         }
         ctx.waitTicks(1);
     }
-    state.timeout_count +%= 1;
+    _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
     return null;
 }
 
 fn sendImmediateVerb(state: *State, ctx: *const r4os.r4dev.DriverContext, verb: u32) ?u32 {
     const base = mmioBase(state);
     if (!wait16ClearTimed(ctx, base + REG_ICIS, ICIS_BUSY, COMMAND_TIMEOUT_MS)) {
-        state.timeout_count += 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return null;
     }
     write16(base + REG_ICIS, ICIS_VALID);
     write32(base + REG_ICOI, verb);
     write16(base + REG_ICIS, ICIS_BUSY);
     if (!wait16ClearTimed(ctx, base + REG_ICIS, ICIS_BUSY, COMMAND_TIMEOUT_MS)) {
-        state.timeout_count += 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return null;
     }
     if ((read16(base + REG_ICIS) & ICIS_VALID) == 0) {
-        state.timeout_count += 1;
+        _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
         return null;
     }
 
     const response = read32(base + REG_ICII);
     write16(base + REG_ICIS, ICIS_VALID);
-    state.command_count += 1;
-    state.response_count += 1;
+    _ = @atomicRmw(u64, &state.command_count, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &state.response_count, .Add, 1, .monotonic);
     return response;
 }
 
@@ -3515,6 +3769,45 @@ fn logControllerCandidate(
     logLine(ctx, &line, len);
 }
 
+fn captureControllerEvidence(state: *State) void {
+    // Since independent-controller registration, this backend's probe has
+    // exactly one PCI candidate. Preserve its actual immutable discovery
+    // evidence, rather than the empty former winner-selection array.
+    var evidence = controller_policy.Evidence{
+        .inventory_index = state.selected_inventory_index,
+        .transport_ready = state.transport_ready,
+        .discovery_complete = state.codec_ready,
+        .codec_count = state.discovered_codec_count,
+        .route_ready = state.output_path_ok,
+    };
+    for (state.output_catalog[0..state.output_count], 0..) |candidate, index| {
+        if (candidate.role == .hdmi) {
+            evidence.digital_output_pins += 1;
+            if (candidate.sink.availability == .ready) evidence.connected_hdmi = true;
+        } else evidence.analog_output_pins += 1;
+        var unique = true;
+        for (state.output_catalog[0..index]) |previous| {
+            if (previous.codec == candidate.codec and previous.converter == candidate.converter) {
+                unique = false;
+                break;
+            }
+        }
+        if (unique) evidence.output_converters += 1;
+    }
+    state.controller_candidates[0] = .{
+        .present = true,
+        .bus = state.info.bus,
+        .device = state.info.device,
+        .function = state.info.function,
+        .vendor_id = state.info.vendor_id,
+        .device_id = state.info.device_id,
+        .interrupt_line = state.info.interrupt_line,
+        .evidence = evidence,
+    };
+    state.controller_candidate_count = 1;
+    state.controller_rejected_count = 0;
+}
+
 fn logControllerSelectionEvidence(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     var index: usize = 0;
     while (index < state.controller_candidate_count) : (index += 1) {
@@ -3778,7 +4071,7 @@ fn logPlaybackSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void 
     appendText(&line, &len, " underruns=");
     appendDec(&line, &len, state.underrun_count);
     appendText(&line, &len, " errors=");
-    appendDec(&line, &len, state.error_count + @atomicLoad(u64, &state.fifo_error_count, .acquire) + @atomicLoad(u64, &state.descriptor_error_count, .acquire) + state.position_recovery_count + state.queue_overflow_count + state.drain_timeout_count + state.refill_timeout_count);
+    appendDec(&line, &len, @atomicLoad(u64, &state.error_count, .acquire) + @atomicLoad(u64, &state.fifo_error_count, .acquire) + @atomicLoad(u64, &state.descriptor_error_count, .acquire) + state.position_recovery_count + state.queue_overflow_count + state.drain_timeout_count + state.refill_timeout_count);
     logLine(ctx, &line, len);
 
     var detail: [384:0]u8 = undefined;
@@ -3830,7 +4123,7 @@ fn logPlaybackReady(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     appendText(&line, &len, " reset=");
     appendText(&line, &len, if (state.reset_done) "done" else "missing");
     appendText(&line, &len, " commands=");
-    appendDec(&line, &len, state.command_count);
+    appendDec(&line, &len, @atomicLoad(u64, &state.command_count, .acquire));
     appendText(&line, &len, " backend=");
     appendText(&line, &len, if (state.backend_registered) "registered" else "missing");
     logLine(ctx, &line, len);
@@ -3915,7 +4208,7 @@ fn logDiagnosticRuntime(state: *State, ctx: *const r4os.r4dev.DriverContext, pha
     appendText(&line, &len, " rec=");
     appendDec(&line, &len, state.stream_recovery_count);
     appendText(&line, &len, " to=");
-    appendDec(&line, &len, state.timeout_count);
+    appendDec(&line, &len, @atomicLoad(u64, &state.timeout_count, .acquire));
     appendText(&line, &len, " drain=");
     appendDec(&line, &len, state.drain_timeout_count);
     appendText(&line, &len, " wdrop=");

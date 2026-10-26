@@ -106,8 +106,15 @@ pub fn build(b: *std.Build) void {
     const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_tests_module });
     const run_lifecycle_tests = b.addRunArtifact(lifecycle_tests);
 
+    const snapshot_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/output_snapshot.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const run_snapshot_tests = b.addRunArtifact(snapshot_tests);
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
     test_step.dependOn(b.getInstallStep());
+    test_step.dependOn(&run_snapshot_tests.step);
     test_step.dependOn(&run_ring_tests.step);
     test_step.dependOn(&run_work_gate_tests.step);
     test_step.dependOn(&run_controller_policy_tests.step);

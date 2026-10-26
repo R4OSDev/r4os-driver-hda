@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.23
+﻿HDA.R4D 0.3.42
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
@@ -321,3 +321,52 @@ urspruengliches AUTO und Masterwerte sind restauriert. HDA21–23-
 Diagnosemarker sind vor Abschluss zu entfernen. A/V-Zeitbasis und
 Hoerabnahme bleiben offen; Belege:
 ExFiles/Reports/OssiGPU/20261005-tv08237/Checkpoint.txt.
+
+
+0.87.52: Codec-Control getrennt vom Audiodatenpfad
+-------------------------------------------------
+Ein eigener, bei Bedarf beauftragter Control-Besitzer verwendet den bereits
+vorhandenen normalen Treiberworker. Pro Callback wird hoechstens ein HDMI-Pin
+mit unveraendert begrenztem ELD-Lesevertrag untersucht. Produzent oder
+Ausgangsabfrage treiben die endliche restliche Runde; erst danach gilt wieder
+das250ms-Pollintervall. Keine neue periodische Task, kein Audio-Deadlinejob
+fuer Inventararbeit und kein Codec-I/O unter dem PCM-/DMA-Streamlock.
+
+Control besitzt Rohbeobachtungen und Codec-Transport. Der Streambesitzer
+uebernimmt nur einen vollstaendig geprueften Snapshot. Widerspruechliche Pins
+bleiben gesperrt, ohne Rohbeweise zu verlieren. ELD-/Receiver-/Port-/Source-/
+Revision-/Head-/Device-Entry-Wechsel invalidieren die gewaehlte Route.
+Echte Routenwechsel stoppen DMA und reservieren den Ausgang, bevor Control
+den Streamlock fuer Codecprogrammierung freigibt. Explizite Auswahl prueft
+den Receiver erneut; PCM akzeptiert keine gerade umprogrammierte Route.
+
+Ein kontendierter Refiller parkt. Nur echte Streamfreigabe oder neue
+IRQ-Generation begruenden einen Nachfolger; der Pending-/Waiter-Handshake
+verhindert verlorene Freigaben. Stop/Shutdown quiescen normale und Audio-
+Workhandles zusammen. Abgebrochene, nie gestartete Callbacks hinterlassen
+keine Pending-Sperre. Deadline/Budget, PCM-Geometrie, Drain und bestehende
+Besitz-/Timeout-/Receiverpruefungen bleiben bestehen. HDA.CONTROL wird nur
+bei vorhandenen expliziten Close-/Shutdown-Diagnosen ausgegeben.
+
+66Owner-Hostfaelle und echte aktuelle KVM4-Artefakte: AudioDiag inklusive
+vier Neustart-/Close-Generationen, IRQ/Deadline und Shutdown0 gruen; alle
+Fehler-/Miss-/Overrun-/Rejektionsdeltas0. Originaler WAV-Pruefer:
+7607/7607Signaldauer bei44100Hz, kein480/544-Muster. Native Qualifikation
+und finaler STANDARD stehen in Docs/Audio/README.txt.
+
+Die erste native41-Probe bestand PCM/Deadline/Master/Lifecycle, wurde aber
+wegen fehlender Kandidatenquittungen im angeforderten Export nicht final
+abgenommen. Seit separater Controllerregistrierung war das alte Kandidaten-
+Array unbefuellt.42haelt genau die wirkliche PCI-Probe der jeweiligen Instanz
+mit eindeutigen nutzbaren Konvertern fest. Auch ausgewaehltes HDMI-Quiet-Idle
+liefert Kandidat/Selection/Control neben dem bestehenden Core-/Runtimebeleg.
+AudioDiags Pflichtklassen und alle Audio-/Cleanupkriterien bleiben streng.
+
+Final42ist aufOssiPC bytegleich installiert:16/16CPUs, echtesNVIDIA-HDMI
+10DE:228E/10DE009F/MSI/DMA+LPIB, alle AudioDiag-/Export-/4Closekriterien
+gruen. Realer5sHDMI-Kabelwechsel amTV: Receivergeneration9->22, alteRoute
+genaueinmalgesperrt und anschliessende neueWiedergabe wiederfehlerfrei.
+UserbestaetigtTestton/Desktop und DesktopnachWiedereinstecken. Genau1
+finalerKVM4STANDARD e747503f-801b-4cd3-896f-120953151828 lokal und
+R4OSServer vollstaendigvalidiert; kein isolierterHDA-Speedup. Quellen,
+Artefakte und Grenzen in Docs/Audio/README.txt.

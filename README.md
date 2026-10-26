@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.40`
+- Version: `0.3.42`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -172,3 +172,47 @@ Receiver revision changes stop stale streams; the shared AUDSVC policy owns
 selection, master gain, mute and reopening. The known Lenovo analog path
 1022:15E3 / 10EC:0257 is unchanged. No AMD audible hardware acceptance has
 been performed in this milestone; that belongs to 0.80.39.
+
+## Codec control and published output state (0.87.52)
+
+An on-demand control owner serializes codec transport, ELD reads, jack sensing
+and route programming. Its ordinary `r4d-work` callbacks inspect at most one
+physical HDMI pin using the existing bounded read. The producer or output
+query advances the remaining finite sweep; after the last pin, the next sweep
+becomes due in 250 ms. This adds no periodic thread or audio-deadline work.
+
+Raw sink evidence stays with control. A complete checked snapshot is published
+under the stream owner; PCM, status and DMA refill perform no codec I/O.
+Duplicate pin associations remain unavailable without destroying raw evidence.
+Receiver, ELD, port, source, revision, head or device-entry changes revoke the
+selected route. Actual route transitions stop DMA and reserve the route before
+dropping the stream lock for codec programming. Explicit selection revalidates
+the physical receiver; PCM cannot use a route being programmed.
+
+A contended refiller parks after one pass. Real stream release or IRQ-generation
+progress can admit a successor. The waiter/pending handoff closes the race where
+unlock occurs before the current pending claim is released. Stop and shutdown
+join and release the actual ordinary and deadline handles; queued cancellation
+also clears claims whose callbacks never ran. Codec I/O and shared error counters
+have their own serialization or atomic access. Existing refill deadlines,
+budgets, PCM geometry, drain, receiver validation and hardware ownership remain.
+
+The owner test step passes 66 cases. Current-artifact KVM4 AudioDiag, four
+restart/Close generations, real IRQ work and normal shutdown pass with zero
+audio errors, deadline misses, overruns and rejected jobs. The original WAV
+analyzer confirms the 7,607-frame signal span at 44,100 Hz. Hardware and final
+STANDARD evidence is recorded in the project documentation `Audio/README.txt`.
+
+Native qualification exposed an empty legacy controller-candidate array after
+independent-controller registration. Each backend now retains its actual PCI
+probe evidence (including distinct usable converters) and repeats that evidence
+on ordinary Close and selected HDMI quiet idle. AudioDiag's mandatory candidate,
+selection, core and runtime export checks remain intact; no criterion was relaxed.
+
+Final OssiPC qualification runs with all 16 CPUs schedulable and the exact installed
+0.3.42 file: real 10DE:228E/10DE009F HDMI, MSI/DMA+LPIB, strict AudioDiag
+exports and zero error deltas. A real five-second cable removal changed the
+receiver generation from 9 to 22, revoked the old route once and allowed fresh
+error-free playback. The user confirmed the audible tone and visible desktop.
+The one final KVM4 STANDARD and complete normalized R4OS Server readback are
+valid; this broad unisolated run does not measure an isolated HDA speedup.
