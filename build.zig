@@ -112,9 +112,16 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     const run_snapshot_tests = b.addRunArtifact(snapshot_tests);
+    const cursor_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/playback_cursor.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const run_cursor_tests = b.addRunArtifact(cursor_tests);
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_snapshot_tests.step);
+    test_step.dependOn(&run_cursor_tests.step);
     test_step.dependOn(&run_ring_tests.step);
     test_step.dependOn(&run_work_gate_tests.step);
     test_step.dependOn(&run_controller_policy_tests.step);

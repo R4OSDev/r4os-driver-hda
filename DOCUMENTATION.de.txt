@@ -1,4 +1,4 @@
-﻿HDA.R4D 0.3.42
+﻿HDA.R4D 0.3.43
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.

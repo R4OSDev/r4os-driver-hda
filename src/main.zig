@@ -15,6 +15,7 @@ const irq_recovery = @import("irq_recovery.zig");
 const lifecycle = @import("lifecycle.zig");
 const hdmi = @import("hdmi.zig");
 const output_snapshot = @import("output_snapshot.zig");
+const playback_cursor = @import("playback_cursor.zig");
 const amd_hdmi = @import("amd_hdmi.zig");
 
 comptime {
@@ -326,7 +327,14 @@ const State = struct {
     controller_rejected_count: u8 = 0,
     controller_candidates: [MAX_CONTROLLER_CANDIDATES]ControllerCandidateSnapshot = .{ControllerCandidateSnapshot{}} ** MAX_CONTROLLER_CANDIDATES,
     selected_inventory_index: u32 = ~@as(u32, 0),
-    backend: r4os.r4dev.AudioOutputIdleBackend = .{ .base = .{ .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput } }, .idle = idlePlaybackBackend },
+    backend: r4os.r4dev.AudioOutputPlaybackBackend = .{
+        .base = .{ .base = .{ .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput } }, .idle = idlePlaybackBackend },
+        .write_tracked = writePcmTracked,
+        .playback = backendPlayback,
+        .flow = backendFlow,
+    },
+    pcm_cursor: playback_cursor.Cursor = .{},
+    source_flow: r4os.abi.AudioBackendFlow = .{},
     output_catalog: [32]OutputCandidate = .{OutputCandidate{}} ** 32,
     output_count: usize = 0,
     active_output_index: i32 = -1,
@@ -336,6 +344,7 @@ const State = struct {
     control_snapshot: output_snapshot.Snapshot = .{},
     published_snapshot_generation: u64 = 1,
     control_cursor: usize = 0,
+    control_has_hdmi: bool = false,
     control_result_ready: bool = false,
     control_lock: bool = false,
     control_pending: bool = false,
@@ -1304,8 +1313,10 @@ fn chooseOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext) vo
         }
     }
 
-    for (state.output_catalog[0..state.output_count], 0..) |candidate, index|
+    for (state.output_catalog[0..state.output_count], 0..) |candidate, index| {
         state.control_snapshot.sinks[index] = candidate.sink;
+        state.control_has_hdmi = state.control_has_hdmi or candidate.role == .hdmi;
+    }
     rejectAmbiguousDisplayPins(state);
     state.output_routes[outputRouteIndex(.hdmi)] = .{};
     for (state.output_catalog[0..state.output_count]) |candidate| if (candidate.role == .hdmi and candidate.sink.availability == .ready) {
@@ -1538,6 +1549,8 @@ fn buildOutputPlan(state: *State, candidate: OutputCandidate) ?codec_program.Pro
 }
 
 fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, candidate: OutputCandidate) bool {
+    const changed_output = state.output.codec != candidate.codec or state.output.pin != candidate.pin or
+        state.output.converter != candidate.converter or !hdmi.sameReceiver(state.output.sink, candidate.sink);
     if (candidate.role == .hdmi) {
         const current = readHdmiSink(state, ctx, candidate.codec, candidate.pin);
         if (current.availability != .ready or !hdmi.sameReceiver(current, candidate.sink)) return false;
@@ -1554,6 +1567,7 @@ fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, c
         _ = deactivateOutputCandidate(state, candidate);
         return false;
     }
+    if (changed_output) state.pcm_cursor.changeOutput();
     state.output = candidate;
     state.output_stream_id = FIRST_STREAM_ID;
     state.output_channel_id = FIRST_CHANNEL_ID;
@@ -1669,7 +1683,7 @@ fn switchOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, ca
 }
 
 fn pollJackAndSwitch(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    if (state.explicit_output or state.output.role == .hdmi) return;
+    if (@atomicLoad(bool, &state.explicit_output, .acquire) or state.output.role == .hdmi) return;
     if (!state.jack_poll_supported) return;
     const now = ctx.tickCount();
     if (now < state.jack_next_poll_tick) return;
@@ -1864,6 +1878,7 @@ fn resetStreamDescriptor(state: *State, ctx: *const r4os.r4dev.DriverContext) bo
     }
     resetPositionTracking(state);
     clearPositionDmaEntry(state);
+    state.pcm_cursor.reset();
     write32(state.stream_desc_base + SD_CTL, streamControlBase(state));
     return true;
 }
@@ -1913,6 +1928,7 @@ fn resetPositionTracking(state: *State) void {
 }
 
 fn clearStreamBuffers(state: *State) void {
+    state.pcm_cursor.clearIdle();
     if (state.stream_dma.virt_addr == 0) return;
     const ptr: [*]u8 = @ptrFromInt(state.stream_dma.virt_addr);
     @memset(ptr[0..DMA_RING_BYTES], 0);
@@ -2234,9 +2250,9 @@ fn waitRunClear(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
-    state.backend.base.base = .{
-        .version = r4os.abi.audio_backend_idle_version,
-        .size = @sizeOf(r4os.r4dev.AudioOutputIdleBackend),
+    state.backend.base.base.base = .{
+        .version = r4os.abi.audio_backend_playback_version,
+        .size = @sizeOf(r4os.r4dev.AudioOutputPlaybackBackend),
         .formats = r4os.abi.audio_backend_format_s16le | r4os.abi.audio_backend_format_u8,
         .min_rate = MIN_RATE,
         .max_rate = MAX_RATE,
@@ -2248,7 +2264,7 @@ fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) 
         .shutdown = shutdownBackend,
         .status = backendStatus,
     };
-    const rc = ctx.registerAudioOutputIdle(&state.backend_name, &state.backend);
+    const rc = ctx.registerAudioOutputPlayback(&state.backend_name, &state.backend);
     state.last_result = rc;
     if (rc != 0) {
         _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
@@ -2274,6 +2290,7 @@ fn acceptsPcmInput(rate: u32, channels: u16, format: u16) bool {
 }
 
 fn refreshOutputs(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+    if (!state.control_has_hdmi and (!state.jack_poll_supported or @atomicLoad(bool, &state.explicit_output, .acquire))) return;
     if (ctx.tickCount() < @atomicLoad(u64, &state.output_poll_tick, .acquire)) return;
     scheduleControlWork(state);
 }
@@ -2384,6 +2401,7 @@ fn publishControlSnapshot(state: *State, ctx: *const r4os.r4dev.DriverContext) b
             // Actual hotplug invalidates the complete published route before
             // any caller can accept PCM against its old receiver generation.
             _ = stopPlayback(state, ctx, false);
+            state.pcm_cursor.changeOutput();
             @atomicStore(bool, &state.route_transition, true, .release);
             state.output_path_ok = false;
             @atomicStore(i32, &state.active_output_index, -1, .release);
@@ -2492,7 +2510,7 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
         return -1;
     }
     if (@atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index)) and state.output_path_ok) {
-        state.explicit_output = true;
+        @atomicStore(bool, &state.explicit_output, true, .release);
         const ready = prepareSelectedCarrier(state);
         releaseStream(state);
         return if (ready) 0 else -1;
@@ -2512,7 +2530,7 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
     defer @atomicStore(bool, &state.route_transition, false, .release);
     if (!switched) return -1;
     state.lifecycle.acquireAtomic(.route);
-    state.explicit_output = true;
+    @atomicStore(bool, &state.explicit_output, true, .release);
     return if (prepareSelectedCarrier(state)) 0 else -1;
 }
 
@@ -2523,6 +2541,15 @@ fn activeOutput(raw: u64) callconv(.c) i32 {
 }
 
 fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16) callconv(.c) i32 {
+    return writePcmInner(context_arg, data, len, rate, channels, format, null);
+}
+
+fn writePcmTracked(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16, receipt: *r4os.abi.AudioBackendWriteReceipt) callconv(.c) i32 {
+    receipt.* = .{};
+    return writePcmInner(context_arg, data, len, rate, channels, format, receipt);
+}
+
+fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16, receipt: ?*r4os.abi.AudioBackendWriteReceipt) i32 {
     const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
     var ctx = context(state);
     const write_start = ctx.tickCount();
@@ -2568,7 +2595,7 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
 
     refreshPlaybackPosition(state, &ctx);
     fillDmaPeriods(state, &ctx);
-    if (state.playback_started and bufferedPlaybackPeriods(state) >= BUFFER_TARGET_PERIODS) {
+    if (state.playback_started and bufferedPlaybackPeriods(state) >= targetPeriods(state)) {
         return finishWrite(state, r4os.abi.service_api_result_busy, write_start);
     }
     const required_capacity = output_frames * pcm.TARGET_FRAME_BYTES;
@@ -2602,6 +2629,8 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     }
 
     state.converted_frame_count +%= state.last_output_bytes / pcm.TARGET_FRAME_BYTES;
+    const first_frame = state.pcm_cursor.current.accepted;
+    _ = state.pcm_cursor.accept(state.last_output_bytes / pcm.TARGET_FRAME_BYTES);
     state.write_count += 1;
     state.last_pcm_tick = ctx.tickCount();
     if (@atomicLoad(bool, &state.silent_carrier, .acquire) and !resumeCarrierPcm(state, &ctx)) {
@@ -2612,6 +2641,15 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
         state.start_due_tick = state.last_pcm_tick +| msTicks(&ctx, 10);
     fillDmaPeriods(state, &ctx);
     startPlaybackIfNeeded(state);
+    if (receipt) |out| {
+        out.* = .{
+            .flags = if (state.pcm_cursor.available) r4os.abi.audio_playback_valid else 0,
+            .output_generation = state.pcm_cursor.current.output,
+            .reset_generation = state.pcm_cursor.current.reset,
+            .first_frame = first_frame,
+            .frames = state.last_output_bytes / pcm.TARGET_FRAME_BYTES,
+        };
+    }
     if (overlapping_control) _ = @atomicRmw(u64, &state.pcm_during_control, .Add, 1, .monotonic);
     return finishWrite(state, 0, write_start);
 }
@@ -2815,6 +2853,54 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
     return 0;
 }
 
+fn backendPlayback(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendPlayback) callconv(.c) i32 {
+    const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
+    out.* = .{};
+    if (!tryAcquireStream(state)) return r4os.abi.service_api_result_busy;
+    defer releaseStream(state);
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) return r4os.abi.service_api_result_busy;
+    const ctx = context(state);
+    if (state.dma_ready) refreshPlaybackPosition(state, &ctx);
+    const cursor = &state.pcm_cursor;
+    out.* = .{
+        .flags = (if (cursor.available and state.dma_ready and state.output_path_ok) r4os.abi.audio_playback_valid else @as(u32, 0)) |
+            (if (cursor.previous_valid) r4os.abi.audio_playback_previous_valid else @as(u32, 0)) |
+            (if (state.playback_started) r4os.abi.audio_playback_running else @as(u32, 0)) |
+            (if (@atomicLoad(bool, &state.silent_carrier, .acquire)) r4os.abi.audio_playback_quiet else @as(u32, 0)),
+        .output_generation = cursor.current.output,
+        .reset_generation = cursor.current.reset,
+        .accepted_frames = cursor.current.accepted,
+        .dma_frames = cursor.current.submitted,
+        .consumed_frames = cursor.current.consumed,
+        .previous_output_generation = cursor.previous.output,
+        .previous_reset_generation = cursor.previous.reset,
+        .previous_accepted_frames = cursor.previous.accepted,
+        .previous_dma_frames = cursor.previous.submitted,
+        .previous_consumed_frames = cursor.previous.consumed,
+        .max_queue_frames = @intCast(targetPeriods(state) * playback_cursor.period_frames),
+    };
+    return 0;
+}
+
+fn backendFlow(context_arg: ?*anyopaque, flow: *const r4os.abi.AudioBackendFlow) callconv(.c) i32 {
+    const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
+    if (flow.version != 1 or flow.size != @sizeOf(r4os.abi.AudioBackendFlow) or flow.reserved != 0 or
+        (flow.flags & ~r4os.abi.audio_flow_continuous) != 0) return r4os.abi.service_api_result_invalid;
+    if ((flow.flags & r4os.abi.audio_flow_continuous) != 0 and
+        (flow.source_due_ns == 0 or flow.low_water_frames == 0 or flow.low_water_frames >= flow.high_water_frames or
+            flow.high_water_frames > BUFFER_TARGET_PERIODS * playback_cursor.period_frames)) return r4os.abi.service_api_result_invalid;
+    if (!tryAcquireStream(state)) return r4os.abi.service_api_result_busy;
+    defer releaseStream(state);
+    if (flow.output_generation != 0 and flow.output_generation != state.pcm_cursor.current.output) return r4os.abi.service_api_result_invalid;
+    state.source_flow = flow.*;
+    return 0;
+}
+
+fn targetPeriods(state: *const State) usize {
+    if ((state.source_flow.flags & r4os.abi.audio_flow_continuous) == 0) return BUFFER_TARGET_PERIODS;
+    return @max(1, (@as(usize, state.source_flow.high_water_frames) + playback_cursor.period_frames - 1) / playback_cursor.period_frames);
+}
+
 fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     if (@atomicLoad(bool, &state.silent_carrier, .acquire)) return;
     while (state.pcm_queue.used >= DMA_BUFFER_BYTES) {
@@ -2824,6 +2910,7 @@ fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
         const out = dmaSlice(state, slot) orelse break;
         if (!state.pcm_queue.readExact(&state.pcm_queue_storage, out)) break;
         if (!state.periods.commit(slot)) break;
+        if (!state.pcm_cursor.submit(slot, playback_cursor.period_frames)) state.pcm_cursor.available = false;
         state.last_output_buffers += 1;
         state.refill_count +%= 1;
         recordTickStat(state, &state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
@@ -2859,6 +2946,7 @@ fn commitTailPeriod(state: *State) bool {
     @memset(out, 0);
     const copied = state.pcm_queue.readAvailable(&state.pcm_queue_storage, out);
     if (copied == 0 or !state.periods.commit(slot)) return false;
+    if (!state.pcm_cursor.submit(slot, copied / pcm.TARGET_FRAME_BYTES)) state.pcm_cursor.available = false;
     state.idle_postroll.reset();
     state.tail_padding_frames +%= (DMA_BUFFER_BYTES - copied) / pcm.TARGET_FRAME_BYTES;
     state.last_output_buffers += 1;
@@ -2872,6 +2960,7 @@ fn queueDrainPostroll(state: *State, remaining: *usize) void {
         const out = dmaSlice(state, slot) orelse return;
         @memset(out, 0);
         if (!state.periods.commit(slot)) return;
+        state.pcm_cursor.silence(slot);
         remaining.* -= 1;
         state.drain_postroll_period_count +%= 1;
         state.refill_count +%= 1;
@@ -2942,6 +3031,7 @@ fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext) 
     const old_current = state.periods.current;
     const current = (@as(usize, choice.position) / @as(usize, state.stream_buffer_bytes)) % DMA_BUFFER_COUNT;
     const advance = state.periods.advance(current);
+    state.pcm_cursor.observe(old_current, advance.periods, current, (@as(usize, choice.position) % DMA_BUFFER_BYTES) / pcm.TARGET_FRAME_BYTES);
     if (advance.periods == 0) return;
 
     var slot = old_current;

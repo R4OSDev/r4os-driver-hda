@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.42`
+- Version: `0.3.43`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -172,6 +172,24 @@ Receiver revision changes stop stale streams; the shared AUDSVC policy owns
 selection, master gain, mute and reopening. The known Lenovo analog path
 1022:15E3 / 10EC:0257 is unchanged. No AMD audible hardware acceptance has
 been performed in this milestone; that belongs to 0.80.39.
+
+## Playback cursor and source flow (0.87.53)
+
+The128-byte PlaybackBackend descriptor extends the unchanged104-byte idle
+prefix with atomic tracked writes, playback snapshots and bounded source-flow
+configuration. Canonical frames are48kHz/stereo/S16. Acceptance, actual DMA
+payload and LPIB-consumed payload have separate counters; silent carrier and
+period padding do not count. Slot payload intervals map partial/current DMA
+positions to PCM sequence numbers. Output/reset generations and the last
+nonempty retired epoch preserve only the known prefix across resets; unknown
+data is never replayed or credited as consumed.
+
+Continuous source flow caps hardware queue targets from the declared high
+watermark (SNES:1920frames/four periods); other sources retain their existing
+queue policy. Cursor/flow callbacks use existing stream ownership, no codec
+I/O and no extra thread. Ordinary codec control retains the0.87.52 separation
+described below. Native receipts and limits are documented by the workspace
+audio owner in `Docs/Audio/PlaybackProgress.txt`.
 
 ## Codec control and published output state (0.87.52)
 
