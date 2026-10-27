@@ -1,10 +1,29 @@
-﻿HDA.R4D 0.3.43
+﻿HDA.R4D 0.3.44
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
 Das Modul wird als R4D ueber R4DEV geladen und stellt den aktiven PCM-Backend-
 Vertrag fuer AUDSVC bereit. Der Kernel enthaelt nur gemeinsame PCI-, IRQ-,
 DMA-, Driver-Work- und Audio-Registrierungsmechanismen.
+
+0.87.55: Standard-ELD-Abfragen koennen nach hoechstens16Verbaufrufen an das
+FIFO-Ende derselben normalen Workqueue zurueckkehren. Ein Ticket, eine
+Completion und die urspruengliche ELD-Bytefrist bleiben ueber alle Turns
+erhalten; Teilscratch ist kein Sinknachweis. Der Kontrolllock und das aktive
+IO-Flag sind vor der Callbackrueckkehr freigegeben. Neuere explizite
+Routengenerationen verwerfen alten Scratch. HDA.COOP meldet reale Turns,
+Fortsetzungen und maximale Verbaufrufe; der CORB-Kurzburst begrenzt auch die
+Summe dekodierter RIRB-Antworten auf64vor dem bestehenden echten Tickwait.
+Fehlende Antworten verlaengern keine Frist. Initinventar, explizite Auswahl,
+AMD-Sonderprotokoll und echter DMA-Stopp sind getrennte Operationen.
+HDA44 setzt DriverApi38 voraus; Tabellenlayout und alte Slots bleiben gleich.
+Details/Besitzentscheidung: Docs/Core/Parallelitaet.txt, Abschnitt0.87.55.
+Native55/Kernel413 mit16schedulierbarenCPUs:396realeKontrollturns,
+234Fortsetzungen und max16Verbaufrufe;7Module+original503ByteCONFIG komplett
+zurueckgelesen. GAP1440realconsumed/sameGeneration/einOpen/echterClose,
+OriginalAudio8280/Master/Mute/2Streams/4Close/Reopen/IRQ/Deadline sowie480-
+Progress bestehen. Keine neue menschliche Sicht-/Hoerquittung; Source- und
+Benchmark-/Abschlussgrenzen bleiben im Abschnitt0.87.55 der Fachdoc.
 
 Controller, Reset und Codecinventar
 -----------------------------------

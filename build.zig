@@ -119,6 +119,12 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_cursor_tests = b.addRunArtifact(cursor_tests);
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
+    const eld_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/eld_probe.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(eld_tests).step);
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_snapshot_tests.step);
     test_step.dependOn(&run_cursor_tests.step);

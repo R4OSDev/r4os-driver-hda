@@ -47,6 +47,49 @@ pub fn isMatchingSolicited(response: Response, codec: u8) bool {
     return !response.unsolicited and response.codec == (codec & 0x0F);
 }
 
+/// Bound the whole short response burst, including unsolicited/mismatched
+/// DMA entries. Previously each poll could drain another full 256-entry ring.
+/// After the first wait, absent replies retain the original once-per-tick
+/// pacing and the caller's original command deadline.
+pub const ResponseBurst = struct {
+    pub const limit = 64;
+    polls: usize = 0,
+    entries: usize = 0,
+    pub fn canConsume(self: *const @This()) bool {
+        return self.entries < limit;
+    }
+    pub fn consumed(self: *@This()) void {
+        self.entries += 1;
+    }
+    pub fn shouldWait(self: *@This()) bool {
+        self.polls = @min(limit, self.polls + 1);
+        return self.polls >= limit or self.entries >= limit;
+    }
+    pub fn waited(self: *@This()) void {
+        self.entries = 0;
+    }
+};
+
+test "unsolicited response flood cannot extend one short burst beyond64entries" {
+    var burst = ResponseBurst{};
+    for (0..ResponseBurst.limit) |_| {
+        try std.testing.expect(burst.canConsume());
+        burst.consumed();
+    }
+    try std.testing.expect(!burst.canConsume());
+    try std.testing.expect(burst.shouldWait());
+    burst.waited();
+    try std.testing.expect(burst.canConsume());
+}
+
+test "missing responses keep once-per-tick pacing after the first short burst" {
+    var burst = ResponseBurst{};
+    for (0..ResponseBurst.limit - 1) |_| try std.testing.expect(!burst.shouldWait());
+    try std.testing.expect(burst.shouldWait());
+    burst.waited();
+    try std.testing.expect(burst.shouldWait());
+}
+
 /// Immediate Commands are a diagnostic escape hatch, not an automatic
 /// replacement for a failed regular transport. A caller must opt in.
 pub fn useImmediateFallback(corb_ready: bool, immediate_enabled: bool) bool {

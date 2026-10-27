@@ -15,6 +15,7 @@ const irq_recovery = @import("irq_recovery.zig");
 const lifecycle = @import("lifecycle.zig");
 const hdmi = @import("hdmi.zig");
 const output_snapshot = @import("output_snapshot.zig");
+const eld_probe = @import("eld_probe.zig");
 const playback_cursor = @import("playback_cursor.zig");
 const amd_hdmi = @import("amd_hdmi.zig");
 
@@ -346,6 +347,11 @@ const State = struct {
     control_cursor: usize = 0,
     control_has_hdmi: bool = false,
     control_result_ready: bool = false,
+    control_probe: eld_probe.Probe = .{},
+    control_probe_generation: u64 = 0,
+    control_steps: u64 = 0,
+    control_continuations: u64 = 0,
+    control_max_verbs: u64 = 0,
     control_lock: bool = false,
     control_pending: bool = false,
     control_wait_owner: bool = false,
@@ -556,7 +562,7 @@ fn msTicks(ctx: *const r4os.r4dev.DriverContext, ms: u64) u64 {
 
 export fn hda_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     const ctx = r4os.r4dev.DriverContext.init(api);
-    if (!ctx.apiCompatible()) return -10;
+    if (!ctx.apiCompatible() or api.version < r4os.abi.driver_api_continuation_work_version) return -10;
     controller_count = 0;
     var start: u32 = 0;
     var ready: usize = 0;
@@ -1379,17 +1385,25 @@ fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, 
     }
     const final_sense = sendVerb(state, makeVerb(codec, pin, VERB_GET_PIN_SENSE, 0)) orelse
         return .{ .availability = .invalid_eld };
-    var sink = hdmi.inspect(final_sense, bytes[0..size]);
+    const sink = hdmi.inspect(final_sense, bytes[0..size]);
     if (sink.availability == .invalid_eld)
         return .{ .availability = .invalid_eld };
+    return associateHdmiSink(state, sink, bytes[0..size]);
+}
+
+fn associateHdmiSink(state: *State, initial: hdmi.Sink, bytes: []const u8) hdmi.Sink {
+    var sink = initial;
     if (!state.display_audio_managed or sink.availability != .ready) return sink;
+    const location = (@as(u32, state.info.bus_kind) << 24) | (@as(u32, state.info.bus) << 8) |
+        (@as(u32, state.info.device) << 3) | state.info.function;
+    const device = @as(u32, state.info.vendor_id) | (@as(u32, state.info.device_id) << 16);
     const outputs = state.display_audio orelse return .{ .availability = .waiting_for_eld };
     var index: u32 = 0;
     while (index < r4os.abi.gfx_output_catalog_capacity) : (index += 1) {
         var route: r4os.abi.GfxAudioRoute = .{};
         if (outputs.queryAudio(location, device, index, &route) != 1) break;
         if (!std.mem.eql(u8, &route.port_id, &sink.port_id)) continue;
-        sink = hdmi.associate(sink, bytes[0..size], route, route.state == r4os.abi.gfx_audio_route_ready);
+        sink = hdmi.associate(sink, bytes, route, route.state == r4os.abi.gfx_audio_route_ready);
         var after: r4os.abi.GfxAudioRoute = .{};
         if (outputs.queryAudio(location, device, index, &after) != 1 or !std.meta.eql(route, after)) sink.availability = .waiting_for_eld;
         return sink;
@@ -2225,6 +2239,7 @@ fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         @atomicStore(bool, &state.control_wait_owner, false, .release);
         @atomicStore(bool, &state.control_wait_stream, false, .release);
         @atomicStore(bool, &state.refill_waiting, false, .release);
+        state.control_probe.reset();
     }
     return quiesced;
 }
@@ -2306,9 +2321,10 @@ fn scheduleControlWork(state: *State) void {
     for (state.work_handles[WORK_HANDLE_CAPACITY..]) |*stored| {
         if (@atomicLoad(u32, stored, .acquire) != 0) continue;
         var handle: u32 = 0;
-        // Generic task work has its existing r4d-work worker. It must not use
-        // workSubmitRequest: that API is exclusively the audio-deadline lane.
-        if (ctx.workSubmit(controlWork, @intFromPtr(state), 0, &handle) != 0 or handle == 0) break;
+        // Standard ELD probes retain one normal Work completion across bounded
+        // turns. The audio-deadline lane and its original budget are untouched.
+        const flags: u32 = if (continuingControl(state)) r4os.abi.driver_work_flag_continuation else 0;
+        if (ctx.workSubmit(controlWork, @intFromPtr(state), flags, &handle) != 0 or handle == 0) break;
         @atomicStore(u32, stored, handle, .release);
         state.lifecycle.acquireAtomic(.work);
         return;
@@ -2339,13 +2355,42 @@ fn finishControlWork(state: *State) void {
         scheduleControlWork(state);
 }
 
+fn continuingControl(state: *const State) bool {
+    // The AMD vendor-specific receiver protocol is a distinct, unchanged
+    // operation; it is not silently admitted as a standard ELD continuation.
+    return state.control_has_hdmi and !(state.info.vendor_id == 0x1002 and state.info.device_id == 0x15de);
+}
+
+const EldReader = struct {
+    state: *State,
+    ctx: *const r4os.r4dev.DriverContext,
+    codec: u8,
+    pin: u8,
+    verbs: *u64,
+    pub fn tick(self: *const @This()) u64 {
+        return self.ctx.tickCount();
+    }
+    pub fn timeoutTicks(self: *const @This()) u64 {
+        return msTicks(self.ctx, COMMAND_TIMEOUT_MS);
+    }
+    pub fn verb(self: *const @This(), command: u16, payload: u8) ?u32 {
+        self.verbs.* += 1;
+        return sendVerb(self.state, makeVerb(self.codec, self.pin, command, payload));
+    }
+};
+
 fn controlWork(raw: usize) callconv(.c) i32 {
     const state: *State = @ptrFromInt(raw);
     const ctx = context(state);
     releaseCompletedWork(state, &ctx, .worker);
-    defer finishControlWork(state);
-    if (@atomicLoad(bool, &state.shutting_down, .acquire)) return 0;
+    var resumed = false;
+    defer if (!resumed) finishControlWork(state);
+    if (@atomicLoad(bool, &state.shutting_down, .acquire) or @atomicLoad(bool, &state.control_quiescing, .acquire)) return 0;
     if (@atomicRmw(bool, &state.control_lock, .Xchg, true, .acq_rel)) {
+        if (continuingControl(state)) {
+            resumed = true;
+            return r4os.abi.driver_work_result_wait;
+        }
         @atomicStore(bool, &state.control_wait_owner, true, .release);
         return 0;
     }
@@ -2355,11 +2400,55 @@ fn controlWork(raw: usize) callconv(.c) i32 {
         // The next producer/query advances the remaining finite sweep; there
         // is no timer thread, periodic scan or immediate control retry loop.
         @atomicStore(bool, &state.control_io_active, true, .release);
+        defer @atomicStore(bool, &state.control_io_active, false, .release);
         var index = state.control_cursor;
         while (index < state.output_count and state.output_catalog[index].role != .hdmi) : (index += 1) {}
         if (index < state.output_count) {
             const candidate = state.output_catalog[index];
-            const sink = readHdmiSink(state, &ctx, candidate.codec, candidate.pin);
+            var sink: hdmi.Sink = undefined;
+            if (continuingControl(state)) {
+                if (state.control_probe.phase != .idle and state.control_probe_generation != state.control_snapshot.generation) {
+                    // Explicit route selection published newer observations
+                    // between turns. Discard this old scratch without ever
+                    // publishing its partial bytes over the newer generation.
+                    state.control_probe.reset();
+                    return 0;
+                }
+                if (state.control_probe.phase == .idle) {
+                    const location = (@as(u32, state.info.bus_kind) << 24) | (@as(u32, state.info.bus) << 8) |
+                        (@as(u32, state.info.device) << 3) | state.info.function;
+                    const device = @as(u32, state.info.vendor_id) | (@as(u32, state.info.device_id) << 16);
+                    var available = true;
+                    if (state.display_audio) |outputs| {
+                        var record: r4os.abi.GfxAudioRoute = .{};
+                        const rc = outputs.queryAudio(location, device, 0, &record);
+                        if (rc < 0) available = false;
+                        if (rc == 1) state.display_audio_managed = true;
+                    }
+                    state.control_probe.begin();
+                    state.control_probe_generation = state.control_snapshot.generation;
+                    if (!available) {
+                        state.control_probe.sink = .{ .availability = .waiting_for_eld };
+                        state.control_probe.phase = .done;
+                    }
+                }
+                var verbs: u64 = 0;
+                const reader = EldReader{ .state = state, .ctx = &ctx, .codec = candidate.codec, .pin = candidate.pin, .verbs = &verbs };
+                var steps: usize = 0;
+                while (steps < eld_probe.verbs_per_turn and state.control_probe.phase != .done) : (steps += 1)
+                    state.control_probe.step(&reader);
+                _ = @atomicRmw(u64, &state.control_steps, .Add, 1, .monotonic);
+                _ = @atomicRmw(u64, &state.control_max_verbs, .Max, verbs, .monotonic);
+                if (state.control_probe.phase != .done) {
+                    _ = @atomicRmw(u64, &state.control_continuations, .Add, 1, .monotonic);
+                    // Both deferred control/IO flags and the physical control
+                    // lock are released before the kernel sees this result.
+                    resumed = true;
+                    return r4os.abi.driver_work_result_continue;
+                }
+                sink = associateHdmiSink(state, state.control_probe.sink, state.control_probe.bytes[0..state.control_probe.size]);
+                state.control_probe.reset();
+            } else sink = readHdmiSink(state, &ctx, candidate.codec, candidate.pin);
             if (sink.availability != state.control_snapshot.sinks[index].availability)
                 logHdmiSink(state, &ctx, candidate.codec, candidate.pin, sink);
             state.control_snapshot.observe(index, sink);
@@ -2370,6 +2459,10 @@ fn controlWork(raw: usize) callconv(.c) i32 {
         state.control_result_ready = true;
     }
     if (!publishControlSnapshot(state, &ctx)) {
+        if (continuingControl(state)) {
+            resumed = true;
+            return r4os.abi.driver_work_result_wait;
+        }
         @atomicStore(bool, &state.control_wait_stream, true, .release);
         return 0;
     }
@@ -2788,6 +2881,15 @@ fn logControlSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     appendDec(&line, &len, @atomicLoad(u64, &state.refill_contended, .acquire));
     appendText(&line, &len, " wakes=");
     appendDec(&line, &len, @atomicLoad(u64, &state.refill_release_wakes, .acquire));
+    logLine(ctx, &line, len);
+    len = 0;
+    appendText(&line, &len, "HDA.COOP turns=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.control_steps, .acquire));
+    appendText(&line, &len, " continues=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.control_continuations, .acquire));
+    appendText(&line, &len, " max-verbs=");
+    appendDec(&line, &len, @atomicLoad(u64, &state.control_max_verbs, .acquire));
+    appendText(&line, &len, " limit=16 ring-burst=64");
     logLine(ctx, &line, len);
 }
 
@@ -3491,7 +3593,7 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
     // sleeping. One tick per normally immediate reply can exhaust an entire
     // ELD read's unchanged 100-ms deadline. Missing replies still yield and
     // expire through that same command deadline and existing wait path.
-    var response_polls: usize = 0;
+    var response_burst = command_ring.ResponseBurst{};
     while (ctx.tickCount() <= deadline) {
         const corb_status = read8(base + REG_CORBSTS);
         const rirb_status = read8(base + REG_RIRBSTS);
@@ -3504,10 +3606,11 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
 
         const hardware_wp = command_ring.normalize(read16(base + REG_RIRBWP) & 0x00FF, state.rirb_entries);
         const rirb: [*]volatile RirbEntry = @ptrFromInt(state.rirb.virt_addr);
-        while (state.rirb_read_pointer != hardware_wp) {
+        while (state.rirb_read_pointer != hardware_wp and response_burst.canConsume()) {
             state.rirb_read_pointer = command_ring.next(state.rirb_read_pointer, state.rirb_entries);
             dmaBarrier();
             const raw = rirb[@intCast(state.rirb_read_pointer)];
+            response_burst.consumed();
             const response = command_ring.decodeResponse(raw.response, raw.extended);
             if (response.unsolicited) {
                 _ = @atomicRmw(u64, &state.unsolicited_response_count, .Add, 1, .monotonic);
@@ -3522,12 +3625,12 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
             return response.value;
         }
         if ((rirb_status & RIRBSTS_RESPONSE) != 0) write8(base + REG_RIRBSTS, RIRBSTS_RESPONSE);
-        response_polls += 1;
-        if (response_polls < 64) {
+        if (!response_burst.shouldWait()) {
             std.atomic.spinLoopHint();
             continue;
         }
         ctx.waitTicks(1);
+        response_burst.waited();
     }
     _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
     return null;
