@@ -125,6 +125,12 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     }) });
     test_step.dependOn(&b.addRunArtifact(eld_tests).step);
+    const idle_drain_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/idle_drain.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    test_step.dependOn(&b.addRunArtifact(idle_drain_tests).step);
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_snapshot_tests.step);
     test_step.dependOn(&run_cursor_tests.step);

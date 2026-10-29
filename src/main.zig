@@ -2,6 +2,7 @@ const std = @import("std");
 const r4os = @import("r4os");
 const pcm = r4os.audio_pcm;
 const stream_ring = @import("stream_ring.zig");
+const idle_drain = @import("idle_drain.zig");
 const work_gate = @import("work_gate.zig");
 const controller_policy = @import("controller_policy.zig");
 const controller_reset = @import("controller_reset.zig");
@@ -471,6 +472,10 @@ const State = struct {
     carrier_lead_periods: u64 = 0,
     carrier_ready_tick: u64 = 0,
     draining: bool = false,
+    idle_close: idle_drain.State = .{},
+    idle_close_result: enum { none, pending, success, failed } = .none,
+    idle_close_receipt: bool = false,
+    idle_close_epoch: idle_drain.Identity = .{ .output = 0, .reset = 0 },
     start_due_tick: u64 = 0,
     underrun_active: bool = false,
     reset_stream_count: u64 = 0,
@@ -538,7 +543,7 @@ const State = struct {
     irq_generation: u64 = 0,
     work_pending: bool = false,
     synchronous_stop: bool = false,
-    work_handles: [WORK_HANDLE_CAPACITY + 4]u32 = .{0} ** (WORK_HANDLE_CAPACITY + 4),
+    work_handles: [WORK_HANDLE_CAPACITY + 5]u32 = .{0} ** (WORK_HANDLE_CAPACITY + 5),
     completion_reap_gate: irq_recovery.ReapGate = .{},
     stream_lock: bool = false,
     recovery_latch: irq_recovery.RecoveryLatch = .{},
@@ -1871,6 +1876,7 @@ fn allocStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn resetStreamDescriptor(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+    cancelIdleClose(state);
     state.reset_stream_count += 1;
     const control = read32(state.stream_desc_base + SD_CTL);
     write32(state.stream_desc_base + SD_CTL, control & ~SD_CTL_RUN);
@@ -2190,7 +2196,8 @@ fn finishRefillTransition(state: *State) i32 {
 fn releaseCompletedWork(state: *State, ctx: *const r4os.r4dev.DriverContext, reap_context: irq_recovery.ReapContext) void {
     if (!state.completion_reap_gate.tryClaim(reap_context)) return;
     defer state.completion_reap_gate.release();
-    for (&state.work_handles) |*stored| {
+    for (&state.work_handles, 0..) |*stored, index| {
+        if (index == WORK_HANDLE_CAPACITY + 4 and @atomicLoad(bool, &state.idle_close_receipt, .acquire)) continue;
         const handle = @atomicLoad(u32, stored, .acquire);
         if (handle == 0) continue;
         var status: r4os.abi.DriverCompletionStatus = .{};
@@ -2242,6 +2249,33 @@ fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         state.control_probe.reset();
     }
     return quiesced;
+}
+
+fn releaseIdleRefillWork(state: *State, ctx: *const r4os.r4dev.DriverContext) idle_drain.Retirement {
+    if (!state.completion_reap_gate.tryClaim(.task)) return .pending;
+    defer state.completion_reap_gate.release();
+    defer syncWorkOwnership(state);
+    var pending = false;
+    for (state.work_handles[0..WORK_HANDLE_CAPACITY]) |*stored| {
+        const handle = @atomicLoad(u32, stored, .acquire);
+        if (handle == 0) continue;
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        if (ctx.completionStatus(handle, &status) != 0) return .failed;
+        if (status.state == r4os.abi.driver_work_state_queued) _ = ctx.workCancel(handle);
+        if (status.state != r4os.abi.driver_work_state_completed and status.state != r4os.abi.driver_work_state_cancelled) {
+            pending = true;
+            continue;
+        }
+        if (ctx.completionRelease(handle) != 0) {
+            pending = true;
+            continue;
+        }
+        @atomicStore(u32, stored, 0, .release);
+    }
+    if (pending) return .pending;
+    @atomicStore(bool, &state.work_pending, false, .release);
+    @atomicStore(bool, &state.refill_waiting, false, .release);
+    return .complete;
 }
 
 fn syncWorkOwnership(state: *State) void {
@@ -2318,7 +2352,7 @@ fn scheduleControlWork(state: *State) void {
     @atomicStore(bool, &state.control_wait_owner, false, .release);
     @atomicStore(bool, &state.control_wait_stream, false, .release);
     const ctx = context(state);
-    for (state.work_handles[WORK_HANDLE_CAPACITY..]) |*stored| {
+    for (state.work_handles[WORK_HANDLE_CAPACITY .. WORK_HANDLE_CAPACITY + 4]) |*stored| {
         if (@atomicLoad(u32, stored, .acquire) != 0) continue;
         var handle: u32 = 0;
         // Standard ELD probes retain one normal Work completion across bounded
@@ -2698,6 +2732,7 @@ fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u3
         return finishWrite(state, -3, write_start);
     }
 
+    cancelIdleClose(state);
     state.resampler_state.beginChunk(rate, channels, format);
     var scratch: [DMA_BUFFER_BYTES]u8 = undefined;
     if (pcm.takeDirectChunk(&state.resampler_state, input, rate, channels, format, required_capacity)) |direct| {
@@ -2770,33 +2805,153 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     return setLastResult(state, if (decision.report_failure) -1 else 0);
 }
 
-fn idlePlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
-    const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
-    var ctx = context(state);
-    if (!acquireStream(state, &ctx, 100)) return setLastResult(state, -1);
-    if (@atomicLoad(bool, &state.route_transition, .acquire)) {
-        releaseStream(state);
-        return r4os.abi.service_api_result_busy;
-    }
-    if (!carrierEligible(state)) {
-        releaseStream(state);
-        return stopPlaybackBackend(context_arg);
-    }
-    @atomicStore(bool, &state.synchronous_stop, true, .release);
-    const drained = drainPlayback(state, &ctx);
-    const quiet = drained and enterSilentCarrier(state);
-    if (quiet) state.resampler_state.reset();
-    if (!quiet) _ = stopPlayback(state, &ctx, false);
+// Pending last-stream Close owns only a drain intention, never a sleeping
+// callback or a caller buffer. Actual data and work handles remain resident.
+fn cancelIdleClose(state: *State) void {
+    if (state.idle_close_result == .none and state.idle_close.phase == .idle) return;
+    state.idle_close.reset();
+    state.idle_close_result = .none;
+    @atomicStore(bool, &state.idle_close_receipt, false, .release);
+    state.draining = false;
     @atomicStore(bool, &state.synchronous_stop, false, .release);
+}
+
+const IdleCloseOwner = struct {
+    state: *State,
+    ctx: *const r4os.r4dev.DriverContext,
+    pub fn identity(self: *@This()) idle_drain.Identity {
+        return .{ .output = self.state.pcm_cursor.current.output, .reset = self.state.pcm_cursor.current.reset };
+    }
+    pub fn now(self: *@This()) u64 { return self.ctx.tickCount(); }
+    pub fn tailEmpty(self: *@This()) bool { return self.state.pcm_queue.used == 0; }
+    pub fn begin(self: *@This()) void {
+        const s = self.state;
+        if (s.playback_started or s.periods.queued != 0 or s.pcm_queue.used != 0) s.drain_count +%= 1;
+        s.draining = true;
+        @atomicStore(bool, &s.synchronous_stop, true, .release);
+    }
+    pub fn pump(self: *@This(), tail_flushed: *bool, postroll_remaining: *usize) bool {
+        const s = self.state;
+        if (!s.playback_started and s.periods.queued == 0 and s.pcm_queue.used == 0) return true;
+        releaseCompletedWork(s, self.ctx, .task);
+        refreshPlaybackPosition(s, self.ctx);
+        fillDmaPeriods(s, self.ctx);
+        if (!tail_flushed.*) tail_flushed.* = flushTailPeriod(s, self.ctx);
+        if (tail_flushed.*) queueDrainPostroll(s, postroll_remaining);
+        startPlaybackIfNeeded(s);
+        return tail_flushed.* and postroll_remaining.* == 0 and s.periods.queued == 0 and s.pcm_queue.used == 0;
+    }
+    pub fn quiet(self: *@This()) bool {
+        if (carrierEligible(self.state)) {
+            if (!enterSilentCarrier(self.state)) return false;
+            self.state.resampler_state.reset();
+            return true;
+        }
+        // Every caller period and postroll is already consumed. The normal
+        // analog descriptor stop therefore drops no caller PCM.
+        return stopPlayback(self.state, self.ctx, false);
+    }
+    pub fn retire(self: *@This()) idle_drain.Retirement {
+        return releaseIdleRefillWork(self.state, self.ctx);
+    }
+};
+
+// This ordinary resident Work continuation advances even when the client
+// disconnects. It owns no client pointer, and never borrows the refill deadline
+// lane or cancels the independent HDMI control/probe owner.
+fn idleCloseWork(raw: usize) callconv(.c) i32 {
+    const state: *State = @ptrFromInt(raw);
+    var ctx = context(state);
+    if (@atomicLoad(bool, &state.shutting_down, .acquire) or @atomicLoad(bool, &state.control_quiescing, .acquire)) return 0;
+    if (!tryAcquireStream(state)) return r4os.abi.driver_work_result_wait;
+    if (state.idle_close_result != .pending) {
+        releaseStream(state);
+        return 0;
+    }
+    var owner = IdleCloseOwner{ .state = state, .ctx = &ctx };
+    var progress = state.idle_close;
+    const epoch = owner.identity();
+    const started = progress.started;
+    const was_draining = progress.phase == .draining;
+    const result = progress.poll(&owner, msTicks(&ctx, DRAIN_WAIT_MS), msTicks(&ctx, 100), DRAIN_POSTROLL_PERIODS);
+    if (was_draining and progress.phase != .draining)
+        state.last_drain_wait_ticks = ctx.tickCount() -| started;
+    state.idle_close = progress;
+    // An owned analog descriptor reset cancelled the stored intention; this
+    // private turn adopted only its checked, successful drained transition.
+    state.idle_close_result = .pending;
+    @atomicStore(bool, &state.idle_close_receipt, true, .release);
+    if (result == .pending) {
+        @atomicStore(bool, &state.synchronous_stop, true, .release);
+        releaseStream(state);
+        return r4os.abi.driver_work_result_wait;
+    }
+    state.draining = false;
+    @atomicStore(bool, &state.synchronous_stop, false, .release);
+    if (result != .complete) {
+        if (result == .drain_timeout) {
+            state.drain_timeout_count +%= 1;
+            noteHdaWarn(state, &ctx, "drain timeout");
+        }
+        if (result != .changed and epoch.output == owner.identity().output and epoch.reset == owner.identity().reset)
+            _ = stopPlayback(state, &ctx, false);
+        state.idle_close_result = .failed;
+        @atomicStore(bool, &state.idle_close_receipt, true, .release);
+        releaseStream(state);
+        return 0;
+    }
+    state.idle_close_epoch = owner.identity();
+    state.idle_close_result = .success;
     releaseStream(state);
-    if (!releaseDriverWork(state, &ctx)) return setLastResult(state, -1);
     logControlSummary(state, &ctx);
     logControllerSelectionEvidence(state, &ctx);
     logDiagnosticCore(state, &ctx);
     logDiagnosticRuntime(state, &ctx, "close");
     logIdleSummary(state, &ctx);
     logCarrierSummary(state, &ctx);
-    return setLastResult(state, if (quiet) 0 else -1);
+    return 0;
+}
+
+fn idlePlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
+    const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
+    var ctx = context(state);
+    if (!tryAcquireStream(state)) return r4os.abi.service_api_result_busy;
+    defer releaseStream(state);
+    if (@atomicLoad(bool, &state.route_transition, .acquire)) return r4os.abi.service_api_result_busy;
+    var owner = IdleCloseOwner{ .state = state, .ctx = &ctx };
+    if (!state.completion_reap_gate.tryClaim(.task)) return r4os.abi.service_api_result_busy;
+    defer state.completion_reap_gate.release();
+    const stored = &state.work_handles[WORK_HANDLE_CAPACITY + 4];
+    const handle = @atomicLoad(u32, stored, .acquire);
+    if (handle != 0) {
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        const status_rc = ctx.completionStatus(handle, &status);
+        if (status_rc != 0 or (status.state != r4os.abi.driver_work_state_completed and status.state != r4os.abi.driver_work_state_cancelled)) {
+            return if (status_rc == 0) r4os.abi.service_api_result_busy else setLastResult(state, -1);
+        }
+        if (ctx.completionRelease(handle) != 0) {
+            return r4os.abi.service_api_result_busy;
+        }
+        @atomicStore(u32, stored, 0, .release);
+        syncWorkOwnership(state);
+        const result = state.idle_close_result;
+        const same_epoch = state.idle_close_epoch.output == owner.identity().output and state.idle_close_epoch.reset == owner.identity().reset;
+        cancelIdleClose(state);
+        if (result != .none)
+            return setLastResult(state, if (result == .success and status.state == r4os.abi.driver_work_state_completed and status.result == 0 and same_epoch) 0 else -1);
+    }
+    // Deadline begins before Work submission, including any queue delay.
+    state.idle_close_result = .pending;
+    @atomicStore(bool, &state.idle_close_receipt, true, .release);
+    state.idle_close.start(&owner, msTicks(&ctx, DRAIN_WAIT_MS), DRAIN_POSTROLL_PERIODS);
+    var new_handle: u32 = 0;
+    if (ctx.workSubmit(idleCloseWork, @intFromPtr(state), r4os.abi.driver_work_flag_continuation, &new_handle) != 0 or new_handle == 0) {
+        cancelIdleClose(state);
+        return r4os.abi.service_api_result_busy;
+    }
+    @atomicStore(u32, stored, new_handle, .release);
+    state.lifecycle.acquireAtomic(.work);
+    return r4os.abi.service_api_result_busy;
 }
 
 fn carrierEligible(state: *State) bool {
@@ -3298,6 +3453,7 @@ fn drainPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
+    cancelIdleClose(state);
     if (!state.dma_ready or state.stream_desc_base == 0) return true;
     // The stream owner advances DMA itself through Drain and descriptor reset.
     // A contended deadline worker must not immediately resubmit while this
