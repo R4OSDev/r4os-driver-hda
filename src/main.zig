@@ -346,6 +346,7 @@ const State = struct {
     // owner publishes a complete checked catalog, never pending ELD bytes.
     control_snapshot: output_snapshot.Snapshot = .{},
     published_snapshot_generation: u64 = 1,
+    catalog_epoch: output_snapshot.CatalogEpoch = .{},
     control_cursor: usize = 0,
     control_has_hdmi: bool = false,
     control_result_ready: bool = false,
@@ -780,7 +781,7 @@ fn initController(state: *State, api: *const r4os.r4dev.DriverApi, info: r4os.ab
     }
 
     state.stage = .ready;
-    state.initialized = true;
+    @atomicStore(bool, &state.initialized, true, .release);
     captureControllerEvidence(state);
     logPlaybackReady(state, &ctx);
     logDiagnosticCore(state, &ctx);
@@ -1838,6 +1839,7 @@ fn pollJackAndSwitch(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     @atomicStore(bool, &state.route_transition, true, .release);
     releaseStream(state);
     defer @atomicStore(bool, &state.route_transition, false, .release);
+    state.catalog_epoch.advance();
     if (switchOutputCandidate(state, ctx, candidate)) {
         state.jack_sense = sense;
         logJackPolicy(state, ctx);
@@ -2430,6 +2432,11 @@ fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) 
     }
     state.backend_registered = true;
     state.lifecycle.acquireAtomic(.backend);
+    state.last_result = ctx.registerAudioOutputEpoch(&state.backend_name, outputEpoch);
+    if (state.last_result != 0) {
+        _ = unregisterPlaybackBackend(state, ctx);
+        return false;
+    }
     return true;
 }
 
@@ -2624,6 +2631,7 @@ fn controlWork(raw: usize) callconv(.c) i32 {
 
 fn publishControlSnapshot(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     if (!tryAcquireStream(state)) return false;
+    if (state.published_snapshot_generation != state.control_snapshot.generation) state.catalog_epoch.advance();
     for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| {
         if (candidate.role == .hdmi) candidate.sink = state.control_snapshot.checked(index, state.output_count);
     }
@@ -2639,6 +2647,7 @@ fn publishControlSnapshot(state: *State, ctx: *const r4os.r4dev.DriverContext) b
             _ = stopPlayback(state, ctx, false);
             state.pcm_cursor.changeOutput();
             @atomicStore(bool, &state.route_transition, true, .release);
+            state.catalog_epoch.advance();
             state.output_path_ok = false;
             @atomicStore(i32, &state.active_output_index, -1, .release);
             revoke = state.output;
@@ -2718,7 +2727,7 @@ fn queryOutput(raw: u64, index: u32, out: *r4os.abi.AudioOutputInfo) callconv(.c
     appendDec(&out.name, &len, candidate.pin);
     out.kind = @intFromEnum(candidate.role);
     if (candidate.sink.display_port) out.kind = r4os.abi.audio_output_kind_display_port;
-    out.availability = if (state.initialized) outputAvailability(candidate) else r4os.abi.audio_output_failed;
+    out.availability = if (@atomicLoad(bool, &state.initialized, .acquire)) outputAvailability(candidate) else r4os.abi.audio_output_failed;
     if (!@atomicLoad(bool, &state.route_transition, .acquire) and @atomicLoad(i32, &state.active_output_index, .acquire) == @as(i32, @intCast(index))) out.flags = r4os.abi.audio_output_flag_active;
     out.preferred_rate = pcm.TARGET_RATE;
     out.channels = pcm.TARGET_CHANNELS;
@@ -2726,9 +2735,23 @@ fn queryOutput(raw: u64, index: u32, out: *r4os.abi.AudioOutputInfo) callconv(.c
     return 1;
 }
 
+fn outputEpoch(raw: u64, out: *r4os.abi.AudioOutputEpoch) callconv(.c) i32 {
+    const state: *State = @ptrFromInt(raw);
+    if (!tryAcquireStream(state)) return r4os.abi.service_api_result_busy;
+    defer releaseStream(state);
+    // Topology/IDs are fixed before backend registration. Runtime HDMI rows
+    // publish only in publishControlSnapshot; all runtime route attempts
+    // announce a transition and advance the epoch, including failed restores.
+    if (!@atomicLoad(bool, &state.initialized, .acquire) or @atomicLoad(bool, &state.shutting_down, .acquire) or
+        @atomicLoad(bool, &state.route_transition, .acquire)) return r4os.abi.service_api_result_busy;
+    const generation = state.catalog_epoch.current() orelse return r4os.abi.service_api_result_busy;
+    out.* = .{ .generation = generation, .count = @intCast(state.output_count), .active_index = @atomicLoad(i32, &state.active_output_index, .acquire) };
+    return 1;
+}
+
 fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
     const state: *State = @ptrFromInt(raw);
-    if (index >= state.output_count or !state.initialized) return -1;
+    if (index >= state.output_count or !@atomicLoad(bool, &state.initialized, .acquire)) return -1;
     const ctx = context(state);
     if (!acquireControl(state, &ctx)) return r4os.abi.service_api_result_busy;
     defer releaseControl(state);
@@ -2758,6 +2781,7 @@ fn selectOutput(raw: u64, index: u32) callconv(.c) i32 {
     @atomicStore(bool, &state.route_transition, true, .release);
     releaseStream(state);
     const switched = switchOutputCandidate(state, &ctx, candidate);
+    state.catalog_epoch.advance();
     if (!acquireStream(state, &ctx, 100)) {
         @atomicStore(bool, &state.route_transition, false, .release);
         return r4os.abi.service_api_result_busy;
@@ -3691,7 +3715,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     state.stage = .teardown;
 
     if (!hasHardwareResources(state)) {
-        state.initialized = false;
+        @atomicStore(bool, &state.initialized, false, .release);
         state.stage = if (failed_stage == .none) .none else .failed;
         return true;
     }
@@ -3760,7 +3784,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         noteHdaWarn(state, ctx, "shutdown controller cleanup failed");
         return false;
     }
-    state.initialized = false;
+    @atomicStore(bool, &state.initialized, false, .release);
     state.dma_ready = false;
     state.playback_started = false;
     state.periods.reset();
@@ -3771,7 +3795,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn hasHardwareResources(state: *State) bool {
-    if (state.initialized or state.info.vendor_id != 0 or state.mmio.virt_addr != 0 or
+    if (@atomicLoad(bool, &state.initialized, .acquire) or state.info.vendor_id != 0 or state.mmio.virt_addr != 0 or
         state.corb.phys_addr != 0 or state.rirb.phys_addr != 0 or
         state.stream_bdl.phys_addr != 0 or state.stream_dma.phys_addr != 0 or state.position_dma.phys_addr != 0 or
         state.irq_registered or state.irq_mode != 0 or @atomicLoad(bool, &state.work_pending, .acquire))
@@ -4556,7 +4580,7 @@ fn logIdleSummary(state: anytype, ctx: anytype) void {
 }
 
 fn logPlaybackSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    if (!state.initialized and state.start_count == 0 and state.write_count == 0) return;
+    if (!@atomicLoad(bool, &state.initialized, .acquire) and state.start_count == 0 and state.write_count == 0) return;
     var line: [224:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D playback summary irq=");

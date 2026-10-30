@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.46`
+- Version: `0.3.47`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -249,3 +249,11 @@ receiver generation from 9 to 22, revoked the old route once and allowed fresh
 error-free playback. The user confirmed the audible tone and visible desktop.
 The one final KVM4 STANDARD and complete normalized R4OS Server readback are
 valid; this broad unisolated run does not measure an isolated HDA speedup.
+# Coherent output catalog (0.88.55)
+
+DriverApi39 binds `AudioOutputEpochFn` to the existing playback backend. Its
+try-only stream owner copies the published count, active index and a nonreused
+catalog epoch. HDMI publication and route transitions advance that epoch,
+including failed restoration. Initialization is published atomically; a
+transition or exhausted epoch returns Busy. Scalar output queries and actual
+route/Stop/ELD/playback acknowledgements retain their separate contracts.

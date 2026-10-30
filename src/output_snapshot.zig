@@ -3,6 +3,22 @@ const hdmi = @import("hdmi.zig");
 
 pub const capacity = 32;
 
+/// Actual publication/route transition identity. Exhaustion is terminal for
+/// catalog capture; an old generation is never reused after an ABA change.
+pub const CatalogEpoch = struct {
+    value: u64 = 1,
+    pub fn advance(self: *CatalogEpoch) void {
+        var observed = @atomicLoad(u64, &self.value, .acquire);
+        while (observed != std.math.maxInt(u64)) {
+            observed = @cmpxchgWeak(u64, &self.value, observed, observed + 1, .acq_rel, .acquire) orelse return;
+        }
+    }
+    pub fn current(self: *const CatalogEpoch) ?u64 {
+        const value = @atomicLoad(u64, &self.value, .acquire);
+        return if (value == std.math.maxInt(u64)) null else value;
+    }
+};
+
 /// Codec control owns observations. Only a complete checked value is copied
 /// into the published catalog under the stream owner. Keeping raw evidence
 /// separate prevents one ambiguous pin's publication from erasing the other.
@@ -54,6 +70,15 @@ test "publication rejects stale receiver and every display identity generation" 
 }
 
 test "ambiguous pins retain raw evidence until the conflicting pin really changes" {
+    var epoch: CatalogEpoch = .{};
+    try std.testing.expectEqual(@as(u64, 1), epoch.current().?);
+    epoch.advance();
+    epoch.advance(); // A -> B -> A still has a different publication identity.
+    try std.testing.expectEqual(@as(u64, 3), epoch.current().?);
+    epoch.value = std.math.maxInt(u64) - 1;
+    epoch.advance();
+    epoch.advance();
+    try std.testing.expectEqual(null, epoch.current());
     var snapshot = Snapshot{};
     const ready = hdmi.Sink{ .availability = .ready, .display_source = 2, .display_connector = 3 };
     snapshot.observe(0, ready);
