@@ -232,13 +232,18 @@ try {
 
     New-Item -ItemType Directory -Path $overlayTemp -Force | Out-Null
     New-Item -ItemType Directory -Path $overlayDiag -Force | Out-Null
+    $configLines = @(Get-Content -LiteralPath $baseConfigPath | Where-Object {
+        $_ -notmatch '^\s*OPTION\s+HDA\s+details='
+    })
     if ($IsolationNoHda) {
-        $configLines = @(Get-Content -LiteralPath $baseConfigPath | Where-Object {
+        $configLines = @($configLines | Where-Object {
             $_ -notmatch '^\s*DRIVER=HDA\s*$' -and $_ -notmatch '^\s*DISABLE=HDA\s*$'
         })
         $configLines += 'DISABLE=HDA'
-        [IO.File]::WriteAllText($overlayConfig, (($configLines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($true))
+    } else {
+        $configLines += 'OPTION HDA details=on'
     }
+    [IO.File]::WriteAllText($overlayConfig, (($configLines -join "`r`n") + "`r`n"), [Text.UTF8Encoding]::new($true))
     if ($IsolationNoUpdSvc) {
         New-Item -ItemType Directory -Path $overlayR4osConfig -Force | Out-Null
         $serviceLines = @(Get-Content -LiteralPath $baseServicesPath)

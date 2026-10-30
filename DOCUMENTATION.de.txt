@@ -1,10 +1,34 @@
-﻿HDA.R4D 0.3.44
+﻿HDA.R4D 0.3.46
 =============
 
 HDA.R4D ist der eigenstaendige Intel-High-Definition-Audio-Ausgabetreiber.
 Das Modul wird als R4D ueber R4DEV geladen und stellt den aktiven PCM-Backend-
 Vertrag fuer AUDSVC bereit. Der Kernel enthaelt nur gemeinsame PCI-, IRQ-,
 DMA-, Driver-Work- und Audio-Registrierungsmechanismen.
+
+0.88.49: grosse Abschlussdetails sind standardmaessig aus. Vor dem Laden
+aktiviert OPTION HDA details=on die ausdrueckliche Diagnose. Init-/Admission-
+daten und echte Warnungen/Fehler bleiben erhalten. Ein erfolgreicher normaler
+Stop/Idle/Close erzeugt keine Control-/Kandidaten-/Core-/Runtime-/Idle-/Carrier-
+Detailbloecke und reserviert keinen Diagnose-Semaphor. Echte DMA-, Drain-,
+Work- und Closequittungen entscheiden weiterhin ueber den Abschluss.
+
+Nur bei aktivierter Option wird ein bestehender Treiber-Semaphor lazy im
+Taskkontext angelegt. Seine authentifizierte owner_epoch bindet die geladene
+Treiberinstanz; eine monotone Sequenz serialisiert die Detailausgaben. Unter
+dem realen Streamowner wird ein kleiner Snapshot (hoechstens2048Bytes) samt
+Output-/Resetidentitaet, PCI und Tick erfasst und nach Freigabe formatiert.
+Der Carrier-Steuerwert wird ebenfalls unter diesem Owner gelesen. Kein
+ganzer State oder Codecgraph wird kopiert. Erfolgreicher Treiber-Shutdown
+zerstoert den Diagnose-Semaphor erst nach dem Callback-/Hardwareabbau.
+
+HDA.SNAP und HDA.DET transportieren die langen logischen Zeilen in72Byte-
+Teilen innerhalb der bestehenden160Byte-LOGSVC-Records. Originalzeilenlaenge,
+Teileanzahl, Treiberepoche/Sequenz und Endquittung sind verpflichtend. AUDIOD17
+setzt nur einen frischen vollstaendigen Snapshot zusammen und exportiert
+genau dessen unveraenderliche Werte. /DETAILS und /OUT scheitern bei fehlender
+Aktivierung oder unvollstaendiger Evidenz. Testprofil und Hardware-Abnahme-
+image fordern Details ausdruecklich an; Slim und Full bleiben ohne Option.
 
 0.87.55: Standard-ELD-Abfragen koennen nach hoechstens16Verbaufrufen an das
 FIFO-Ende derselben normalen Workqueue zurueckkehren. Ein Ticket, eine

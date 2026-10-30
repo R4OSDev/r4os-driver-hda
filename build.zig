@@ -119,6 +119,22 @@ pub fn build(b: *std.Build) void {
     }) });
     const run_cursor_tests = b.addRunArtifact(cursor_tests);
     const test_step = b.step("test", "Run HDA PCM queue and DMA period ownership tests");
+    const close_details_module = b.createModule(.{
+        .root_source_file = b.path("src/close_diagnostics.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    close_details_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const close_details_tests = b.addTest(.{ .root_module = close_details_module });
+    test_step.dependOn(&b.addRunArtifact(close_details_tests).step);
+    const close_snapshot_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    close_snapshot_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const close_snapshot_tests = b.addTest(.{ .root_module = close_snapshot_module, .filters = &.{"close snapshot"} });
+    test_step.dependOn(&b.addRunArtifact(close_snapshot_tests).step);
     const eld_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/eld_probe.zig"),
         .target = b.graph.host,

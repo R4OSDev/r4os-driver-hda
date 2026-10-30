@@ -3,6 +3,7 @@ const r4os = @import("r4os");
 const pcm = r4os.audio_pcm;
 const stream_ring = @import("stream_ring.zig");
 const idle_drain = @import("idle_drain.zig");
+const close_diagnostics = @import("close_diagnostics.zig");
 const work_gate = @import("work_gate.zig");
 const controller_policy = @import("controller_policy.zig");
 const controller_reset = @import("controller_reset.zig");
@@ -554,6 +555,108 @@ const State = struct {
     codecs: [MAX_CODECS]CodecInfo = .{CodecInfo{}} ** MAX_CODECS,
 };
 
+/// Copied only for an explicit diagnostic request while the stream owner is
+/// held. No large codec graph, DMA storage, caller pointer or live MMIO borrow.
+const CloseSnapshot = struct {
+    const Codec = struct { vendor_id: u32 = 0 };
+    const Held = struct {
+        bits: u64,
+        fn snapshot(self: *const @This()) u64 {
+            return self.bits;
+        }
+    };
+    const numeric_fields = .{
+        "gcap",                     "output_stream_count",        "input_stream_count",        "bidi_stream_count",       "stream_format",
+        "selected_inventory_index", "controller_candidate_count", "controller_rejected_count", "irq_mode",                "position_source_mismatch_count",
+        "position_fallback_count",  "write_count",                "underrun_count",            "position_recovery_count", "stream_recovery_count",
+        "drain_timeout_count",      "idle_stop_count",            "idle_resume_count",         "idle_tail_count",         "tail_padding_frames",
+        "dropped_frame_count",      "carrier_starts",             "carrier_entries",           "carrier_resumes",         "carrier_lead_periods",
+    };
+    const atomic_fields = .{
+        "control_polls",         "control_publications", "control_invalidations", "pcm_during_control",
+        "refill_during_control", "refill_contended",     "refill_release_wakes",  "control_steps",
+        "control_continuations", "control_max_verbs",    "fifo_error_count",      "descriptor_error_count",
+        "timeout_count",         "irq_work_dropped",     "irq_count",             "irq_work_submitted",
+    };
+    stage: @FieldType(State, "stage"),
+    info: r4os.abi.PciDeviceInfo,
+    transport_mode: @FieldType(State, "transport_mode"),
+    position_source: @FieldType(State, "position_source"),
+    position_dma_enabled: bool,
+    position_dma_degraded: bool,
+    silent_carrier: bool,
+    output: struct { codec: u8, afg: u8, pin: u8, converter: u8, role: codec_program.PinRole },
+    codecs: [MAX_CODECS]Codec = .{Codec{}} ** MAX_CODECS,
+    controller_candidates: [MAX_CONTROLLER_CANDIDATES]ControllerCandidateSnapshot,
+    lifecycle: Held,
+    carrier_control: u32,
+    gcap: u64 = 0,
+    output_stream_count: u64 = 0,
+    input_stream_count: u64 = 0,
+    bidi_stream_count: u64 = 0,
+    stream_format: u64 = 0,
+    selected_inventory_index: u64 = 0,
+    controller_candidate_count: u64 = 0,
+    controller_rejected_count: u64 = 0,
+    irq_mode: u64 = 0,
+    position_source_mismatch_count: u64 = 0,
+    position_fallback_count: u64 = 0,
+    write_count: u64 = 0,
+    underrun_count: u64 = 0,
+    position_recovery_count: u64 = 0,
+    stream_recovery_count: u64 = 0,
+    drain_timeout_count: u64 = 0,
+    idle_stop_count: u64 = 0,
+    idle_resume_count: u64 = 0,
+    idle_tail_count: u64 = 0,
+    tail_padding_frames: u64 = 0,
+    dropped_frame_count: u64 = 0,
+    carrier_starts: u64 = 0,
+    carrier_entries: u64 = 0,
+    carrier_resumes: u64 = 0,
+    carrier_lead_periods: u64 = 0,
+    control_polls: u64 = 0,
+    control_publications: u64 = 0,
+    control_invalidations: u64 = 0,
+    pcm_during_control: u64 = 0,
+    refill_during_control: u64 = 0,
+    refill_contended: u64 = 0,
+    refill_release_wakes: u64 = 0,
+    control_steps: u64 = 0,
+    control_continuations: u64 = 0,
+    control_max_verbs: u64 = 0,
+    fifo_error_count: u64 = 0,
+    descriptor_error_count: u64 = 0,
+    timeout_count: u64 = 0,
+    irq_work_dropped: u64 = 0,
+    irq_count: u64 = 0,
+    irq_work_submitted: u64 = 0,
+
+    fn capture(state: *const State, control: u32) CloseSnapshot {
+        var copy = CloseSnapshot{
+            .stage = state.stage,
+            .info = state.info,
+            .transport_mode = state.transport_mode,
+            .position_source = state.position_source,
+            .position_dma_enabled = state.position_dma_enabled,
+            .position_dma_degraded = state.position_dma_degraded,
+            .silent_carrier = @atomicLoad(bool, &state.silent_carrier, .acquire),
+            .output = .{ .codec = state.output.codec, .afg = state.output.afg, .pin = state.output.pin, .converter = state.output.converter, .role = state.output.role },
+            .controller_candidates = state.controller_candidates,
+            .lifecycle = .{ .bits = state.lifecycle.snapshot() },
+            .carrier_control = control,
+        };
+        if (state.output.codec < copy.codecs.len) copy.codecs[state.output.codec].vendor_id = state.codecs[state.output.codec].vendor_id;
+        inline for (numeric_fields) |field| @field(copy, field) = @field(state, field);
+        inline for (atomic_fields) |field| @field(copy, field) = @atomicLoad(u64, &@field(state, field), .acquire);
+        return copy;
+    }
+};
+comptime {
+    if (@sizeOf(CloseSnapshot) > 2048) @compileError("HDA detail snapshot must remain small");
+}
+
+var diagnostic_owner: close_diagnostics.Owner = .{};
 var controllers: [MAX_CONTROLLER_CANDIDATES]State = .{State{}} ** MAX_CONTROLLER_CANDIDATES;
 var controller_count: usize = 0;
 
@@ -568,6 +671,7 @@ fn msTicks(ctx: *const r4os.r4dev.DriverContext, ms: u64) u64 {
 export fn hda_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     const ctx = r4os.r4dev.DriverContext.init(api);
     if (!ctx.apiCompatible() or api.version < r4os.abi.driver_api_continuation_work_version) return -10;
+    diagnostic_owner.configure(optionEnabled(&ctx, "details"));
     controller_count = 0;
     var start: u32 = 0;
     var ready: usize = 0;
@@ -589,6 +693,7 @@ export fn hda_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
             return -11;
         }
     }
+    if (ready != 0) ctx.logInfo(if (diagnostic_owner.enabled()) "HDA.DIAG mode=details-requested" else "HDA.DIAG mode=details-off");
     return if (ready != 0) 0 else -1;
 }
 
@@ -601,6 +706,10 @@ export fn hda_shutdown() callconv(.c) i32 {
             continue;
         }
         if (!unregisterPlaybackBackend(state, &ctx)) success = false;
+    }
+    if (success and controller_count != 0) {
+        const ctx = context(&controllers[0]);
+        if (!diagnostic_owner.close(&ctx)) success = false;
     }
     if (success) controller_count = 0;
     return if (success) 0 else -1;
@@ -2794,14 +2903,12 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     const drained = stopPlayback(state, &ctx, true);
     const decision = lifecycle.stopDecision(if (drained) .drained else .timeout);
     const stopped = drained or (decision.force_drop and stopPlayback(state, &ctx, false));
+    const details = diagnostic_owner.enabled();
+    const identity = if (details) detailIdentity(state) else close_diagnostics.Identity{ .output = 0, .reset = 0, .pci = 0 };
     releaseStream(state);
     if (!stopped) return setLastResult(state, -1);
     if (!releaseDriverWork(state, &ctx)) return setLastResult(state, -1);
-    logControlSummary(state, &ctx);
-    logControllerSelectionEvidence(state, &ctx);
-    logDiagnosticCore(state, &ctx);
-    logDiagnosticRuntime(state, &ctx, "close");
-    logIdleSummary(state, &ctx);
+    if (details) logCompletionDetails(state, &ctx, identity, "close");
     return setLastResult(state, if (decision.report_failure) -1 else 0);
 }
 
@@ -2822,8 +2929,12 @@ const IdleCloseOwner = struct {
     pub fn identity(self: *@This()) idle_drain.Identity {
         return .{ .output = self.state.pcm_cursor.current.output, .reset = self.state.pcm_cursor.current.reset };
     }
-    pub fn now(self: *@This()) u64 { return self.ctx.tickCount(); }
-    pub fn tailEmpty(self: *@This()) bool { return self.state.pcm_queue.used == 0; }
+    pub fn now(self: *@This()) u64 {
+        return self.ctx.tickCount();
+    }
+    pub fn tailEmpty(self: *@This()) bool {
+        return self.state.pcm_queue.used == 0;
+    }
     pub fn begin(self: *@This()) void {
         const s = self.state;
         if (s.playback_started or s.periods.queued != 0 or s.pcm_queue.used != 0) s.drain_count +%= 1;
@@ -2902,14 +3013,53 @@ fn idleCloseWork(raw: usize) callconv(.c) i32 {
     }
     state.idle_close_epoch = owner.identity();
     state.idle_close_result = .success;
+    const details = diagnostic_owner.enabled();
+    const identity = if (details) detailIdentity(state) else close_diagnostics.Identity{ .output = 0, .reset = 0, .pci = 0 };
     releaseStream(state);
-    logControlSummary(state, &ctx);
-    logControllerSelectionEvidence(state, &ctx);
-    logDiagnosticCore(state, &ctx);
-    logDiagnosticRuntime(state, &ctx, "close");
-    logIdleSummary(state, &ctx);
-    logCarrierSummary(state, &ctx);
+    if (details) logCompletionDetails(state, &ctx, identity, "close");
     return 0;
+}
+
+fn detailIdentity(state: *const State) close_diagnostics.Identity {
+    return .{
+        .output = state.pcm_cursor.current.output,
+        .reset = state.pcm_cursor.current.reset,
+        .pci = (@as(u32, state.info.bus) << 8) | (@as(u32, state.info.device) << 3) | state.info.function,
+    };
+}
+
+fn sameDetailEpoch(state: *const State, expected: close_diagnostics.Identity) bool {
+    const current = detailIdentity(state);
+    return current.output == expected.output and current.reset == expected.reset and current.pci == expected.pci;
+}
+
+// Keep the copied snapshot and formatting buffers out of a normal Close frame.
+// The diagnostic permit is acquired with no stream owner held. Revalidate the
+// exact event after reacquiring that owner; never label a newer route as Close.
+noinline fn logCompletionDetails(state: *State, ctx: *const r4os.r4dev.DriverContext, expected: close_diagnostics.Identity, phase: []const u8) void {
+    const ticket = diagnostic_owner.begin(ctx, msTicks(ctx, 100)) orelse return;
+    defer _ = ticket.release(ctx);
+    if (!acquireStream(state, ctx, 100)) {
+        ctx.logWarn("HDA.DIAG requested details unavailable: stream owner");
+        return;
+    }
+    if (!sameDetailEpoch(state, expected) or @atomicLoad(bool, &state.route_transition, .acquire) or state.stream_desc_base == 0) {
+        releaseStream(state);
+        ctx.logWarn("HDA.DIAG requested details unavailable: changed output epoch");
+        return;
+    }
+    const snapshot = CloseSnapshot.capture(state, read32(state.stream_desc_base + SD_CTL));
+    var captured_identity = expected;
+    captured_identity.tick = ctx.tickCount();
+    releaseStream(state);
+    var emitter = close_diagnostics.Emitter(r4os.r4dev.DriverContext).begin(ctx, ticket, captured_identity, phase);
+    logControlSummary(&snapshot, &emitter);
+    logControllerSelectionEvidence(&snapshot, &emitter);
+    logDiagnosticCore(&snapshot, &emitter);
+    logDiagnosticRuntime(&snapshot, &emitter, phase);
+    logIdleSummary(&snapshot, &emitter);
+    logCarrierSummary(&snapshot, &emitter);
+    _ = emitter.finish();
 }
 
 fn idlePlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
@@ -3019,8 +3169,8 @@ fn resumeCarrierPcm(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn logControlSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [240:0]u8 = undefined;
+fn logControlSummary(state: anytype, ctx: anytype) void {
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 240 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.CONTROL polls=");
     appendDec(&line, &len, @atomicLoad(u64, &state.control_polls, .acquire));
@@ -3048,8 +3198,8 @@ fn logControlSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logLine(ctx, &line, len);
 }
 
-fn logCarrierSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [240:0]u8 = undefined;
+fn logCarrierSummary(state: anytype, ctx: anytype) void {
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 240 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.CARRIER quiet=");
     appendDec(&line, &len, @intFromBool(@atomicLoad(bool, &state.silent_carrier, .acquire)));
@@ -3062,7 +3212,7 @@ fn logCarrierSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     appendText(&line, &len, " lead=");
     appendDec(&line, &len, state.carrier_lead_periods);
     appendText(&line, &len, " ctl=");
-    appendHex(&line, &len, read32(state.stream_desc_base + SD_CTL), 6);
+    appendHex(&line, &len, state.carrier_control, 6);
     logLine(ctx, &line, len);
 }
 
@@ -3546,6 +3696,8 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         return true;
     }
 
+    const details = diagnostic_owner.enabled();
+    var detail_identity: close_diagnostics.Identity = undefined;
     var stopped = true;
     {
         if (!acquireStream(state, ctx, 100)) {
@@ -3556,6 +3708,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         const decision = lifecycle.stopDecision(if (drained) .drained else .timeout);
         stopped = drained or (decision.force_drop and stopPlayback(state, ctx, false));
         disableInterrupts(state);
+        if (details) detail_identity = detailIdentity(state);
         releaseStream(state);
     }
     if (!stopped) {
@@ -3570,8 +3723,7 @@ fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
         noteHdaWarn(state, ctx, "shutdown work quiesce failed");
         return false;
     }
-    logControlSummary(state, ctx);
-    logDiagnosticRuntime(state, ctx, "shutdown");
+    if (details) logCompletionDetails(state, ctx, detail_identity, "shutdown");
     logPlaybackSummary(state, ctx);
     if (state.stream_desc_base != 0) {
         write32(state.stream_desc_base + SD_CTL, read32(state.stream_desc_base + SD_CTL) & ~SD_CTL_RUN);
@@ -4084,10 +4236,10 @@ fn logTransport(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, 
 }
 
 fn logControllerCandidate(
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: anytype,
     candidate: ControllerCandidateSnapshot,
 ) void {
-    var line: [256:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 256 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D controller candidate index=");
     appendDec(&line, &len, candidate.evidence.inventory_index);
@@ -4157,7 +4309,7 @@ fn captureControllerEvidence(state: *State) void {
     state.controller_rejected_count = 0;
 }
 
-fn logControllerSelectionEvidence(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logControllerSelectionEvidence(state: anytype, ctx: anytype) void {
     var index: usize = 0;
     while (index < state.controller_candidate_count) : (index += 1) {
         const candidate = state.controller_candidates[index];
@@ -4166,8 +4318,8 @@ fn logControllerSelectionEvidence(state: *State, ctx: *const r4os.r4dev.DriverCo
     logSelectedController(state, ctx);
 }
 
-fn logSelectedController(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [128:0]u8 = undefined;
+fn logSelectedController(state: anytype, ctx: anytype) void {
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 128 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D selected controller index=");
     appendDec(&line, &len, state.selected_inventory_index);
@@ -4377,8 +4529,8 @@ fn logInterruptSetup(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logLine(ctx, &line, len);
 }
 
-fn logIdleSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [256:0]u8 = undefined;
+fn logIdleSummary(state: anytype, ctx: anytype) void {
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 256 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.IDLE pci=");
     appendHex(&line, &len, state.info.bus, 2);
@@ -4481,8 +4633,8 @@ fn logPlaybackReady(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
 /// Two bounded records form the complete diagnostic snapshot. Each remains
 /// below the LogService record size and is emitted only for ready, close and
 /// shutdown transitions, never for individual writes, verbs or interrupts.
-fn logDiagnosticCore(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
-    var line: [160:0]u8 = undefined;
+fn logDiagnosticCore(state: anytype, ctx: anytype) void {
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 160 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.DIAG core stage=");
     appendText(&line, &len, stageName(state.stage));
@@ -4527,8 +4679,8 @@ fn logDiagnosticCore(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logLine(ctx, &line, len);
 }
 
-fn logDiagnosticRuntime(state: *State, ctx: *const r4os.r4dev.DriverContext, phase: []const u8) void {
-    var line: [160:0]u8 = undefined;
+fn logDiagnosticRuntime(state: anytype, ctx: anytype, phase: []const u8) void {
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 160 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.DIAG run phase=");
     appendText(&line, &len, phase);
@@ -4593,7 +4745,7 @@ fn logWriteRejectOnce(state: *State, ctx: *const r4os.r4dev.DriverContext) void 
     logLine(ctx, &line, len);
 }
 
-fn transportName(state: *State) []const u8 {
+fn transportName(state: anytype) []const u8 {
     return switch (state.transport_mode) {
         .corb_rirb => "corb-rirb",
         .immediate => "immediate",
@@ -4621,7 +4773,10 @@ fn stageName(stage: InitStage) []const u8 {
     };
 }
 
-fn logLine(ctx: *const r4os.r4dev.DriverContext, line: anytype, len: usize) void {
+fn logLine(ctx: anytype, line: anytype, len: usize) void {
+    if (comptime @hasField(@TypeOf(ctx.*), "failed")) {
+        if (len + 1 >= line.len) ctx.failed = true;
+    }
     var capped = len;
     if (capped >= line.len) capped = line.len - 1;
     line[capped] = 0;
@@ -4673,4 +4828,82 @@ fn appendHex(buf: anytype, len: *usize, value: anytype, digits: usize) void {
 fn upper(c: u8) u8 {
     if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
     return c;
+}
+
+const SnapshotTextProbe = struct {
+    var bodies: [close_diagnostics.max_lines][close_diagnostics.max_body_bytes]u8 = undefined;
+    var lengths: [close_diagnostics.max_lines]usize = undefined;
+    var count: usize = 0;
+    pub fn logInfo(_: *const @This(), text: [*:0]const u8) void {
+        const value = std.mem.span(text);
+        std.debug.assert(count < bodies.len and value.len < bodies[0].len);
+        @memcpy(bodies[count][0..value.len], value);
+        lengths[count] = value.len;
+        count += 1;
+    }
+    fn find(prefix: []const u8) ?[]const u8 {
+        for (0..count) |index| {
+            const body = bodies[index][0..lengths[index]];
+            if (std.mem.startsWith(u8, body, prefix)) return body;
+        }
+        return null;
+    }
+};
+
+test "close snapshot owns copied values and every full width counter after live state changes" {
+    const state = try std.testing.allocator.create(State);
+    defer std.testing.allocator.destroy(state);
+    state.* = .{};
+    inline for (CloseSnapshot.numeric_fields) |field| @field(state, field) = std.math.maxInt(@FieldType(State, field));
+    inline for (CloseSnapshot.atomic_fields) |field| @atomicStore(u64, &@field(state, field), std.math.maxInt(u64), .release);
+    state.stage = .ready;
+    state.controller_candidate_count = 1;
+    state.controller_candidates[0].present = true;
+    state.info.bus = 0x12;
+    state.info.device = 0x1b;
+    state.info.function = 3;
+    state.output.codec = 3;
+    state.output.afg = 1;
+    state.output.pin = 7;
+    state.output.converter = 2;
+    state.codecs[3].vendor_id = 0x12345678;
+    state.irq_mode = 2;
+    const snapshot = CloseSnapshot.capture(state, 0x123456);
+    inline for (CloseSnapshot.numeric_fields) |field| try std.testing.expectEqual(@as(u64, @field(state, field)), @field(snapshot, field));
+    inline for (CloseSnapshot.atomic_fields) |field| try std.testing.expectEqual(std.math.maxInt(u64), @field(snapshot, field));
+    try std.testing.expect(@sizeOf(CloseSnapshot) <= 2048 and @sizeOf(CloseSnapshot) < @sizeOf(State) / 16);
+    state.* = .{};
+    state.stream_desc_base = 1; // Any accidental live MMIO read would fault.
+    SnapshotTextProbe.count = 0;
+    const ctx = SnapshotTextProbe{};
+    logControlSummary(&snapshot, &ctx);
+    logControllerSelectionEvidence(&snapshot, &ctx);
+    logDiagnosticCore(&snapshot, &ctx);
+    logDiagnosticRuntime(&snapshot, &ctx, "close");
+    logIdleSummary(&snapshot, &ctx);
+    logCarrierSummary(&snapshot, &ctx);
+    const core = SnapshotTextProbe.find("HDA.DIAG core").?;
+    try std.testing.expect(std.mem.indexOf(u8, core, "codec=3/12345678") != null);
+    try std.testing.expect(std.mem.indexOf(u8, core, "route=7>2") != null);
+    const runtime = SnapshotTextProbe.find("HDA.DIAG run phase=close").?;
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "wr=18446744073709551615") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime, "wdrop=18446744073709551615") != null);
+    try std.testing.expect(std.mem.indexOf(u8, runtime, " own=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, SnapshotTextProbe.find("HDA.CARRIER").?, "ctl=123456") != null);
+}
+
+test "close snapshot rejects changed output reset and controller identities" {
+    const state = try std.testing.allocator.create(State);
+    defer std.testing.allocator.destroy(state);
+    state.* = .{};
+    const identity = detailIdentity(state);
+    try std.testing.expect(sameDetailEpoch(state, identity));
+    state.pcm_cursor.current.output += 1;
+    try std.testing.expect(!sameDetailEpoch(state, identity));
+    state.pcm_cursor.current.output = identity.output;
+    state.pcm_cursor.current.reset += 1;
+    try std.testing.expect(!sameDetailEpoch(state, identity));
+    state.pcm_cursor.current.reset = identity.reset;
+    state.info.function = 1;
+    try std.testing.expect(!sameDetailEpoch(state, identity));
 }

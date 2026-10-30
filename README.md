@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.43`
+- Version: `0.3.46`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -21,10 +21,25 @@ are used only when `OPTION HDA immediate=on` explicitly enables the visible
 fallback; `OPTION HDA corb=off` can be combined with it for diagnostics.
 Discovery covers all 15 codec addresses, every advertised audio function
 group and the complete valid eight-bit node space without silent truncation.
-The bounded controller snapshots include PCI identity and probe evidence and
-are emitted again beside every compact close diagnostic, so an acceptance
-tool can export the complete selection decision before the log window
-advances, even when other applications played audio first.
+The bounded controller snapshots include PCI identity and probe evidence.
+Routine successful Stop/Idle/Close does not format large diagnostic blocks.
+Set `OPTION HDA details=on` before loading the driver to request them; the
+default is off. Init admission data and actual warnings/errors remain visible.
+
+Requested completion details copy at most 2048 bytes under the stream owner,
+then format after releasing it. Every snapshot binds the authenticated loaded
+driver epoch, diagnostic sequence, output/reset identity, PCI function and
+capture tick. A lazily allocated existing driver semaphore serializes these
+explicit snapshots and is destroyed during successful shutdown. The normal
+off path allocates no diagnostic resource and performs no detail capture.
+
+LogService's 160-byte records carry bounded `HDA.SNAP`/`HDA.DET` fragments.
+AUDIOD checks declared body lengths, all parts and the terminal counts before
+accepting core/runtime/controller evidence. `/DETAILS` and `/OUT=<path>`
+require a fresh complete snapshot; they fail if the boot option is off or
+evidence is incomplete. `/OUT` writes that validated immutable snapshot.
+Test-profile and hardware-acceptance images explicitly enable the option;
+Slim and Full keep the default off.
 
 NVIDIA PCIe controllers disable and verify No Snoop in their own Device Control
 register before starting DMA into normal cached RAM. Legacy PCI controllers
