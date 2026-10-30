@@ -133,7 +133,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     close_snapshot_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
-    const close_snapshot_tests = b.addTest(.{ .root_module = close_snapshot_module, .filters = &.{"close snapshot"} });
+    const close_snapshot_tests = b.addTest(.{ .root_module = close_snapshot_module, .filters = &.{ "close snapshot", "retired PCM detail timing" } });
     test_step.dependOn(&b.addRunArtifact(close_snapshot_tests).step);
     const eld_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("src/eld_probe.zig"),

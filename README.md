@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.3.47`
+- Version: `0.3.48`
 - Image target: `/R4OS/DRIVERS/HDA.R4D`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -257,3 +257,9 @@ catalog epoch. HDMI publication and route transitions advance that epoch,
 including failed restoration. Initialization is published atomically; a
 transition or exhausted epoch returns Busy. Scalar output queries and actual
 route/Stop/ELD/playback acknowledgements retain their separate contracts.
+
+R4OS0.88.59 removes only the unused write/refill duration bookkeeping.
+The fixed128-byte AudioBackendStatus duration slots now return the explicit
+Contract0.64.61 audio_duration_ticks_unavailable sentinel (UINT64_MAX).
+Functional clocks/deadlines, PCM admission, DMA/IRQ progress, errors and
+actual terminal Close remain in place. Never treat the sentinel as latency.

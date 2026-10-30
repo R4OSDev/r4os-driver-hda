@@ -485,12 +485,6 @@ const State = struct {
     write_count: u64 = 0,
     refill_count: u64 = 0,
     silence_refill_count: u64 = 0,
-    write_total_ticks: u64 = 0,
-    write_max_ticks: u64 = 0,
-    write_last_ticks: u64 = 0,
-    refill_total_ticks: u64 = 0,
-    refill_max_ticks: u64 = 0,
-    refill_last_ticks: u64 = 0,
     start_count: u64 = 0,
     stop_count: u64 = 0,
     drain_count: u64 = 0,
@@ -2812,36 +2806,35 @@ fn writePcmTracked(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: 
 fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16, receipt: ?*r4os.abi.AudioBackendWriteReceipt) i32 {
     const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
     var ctx = context(state);
-    const write_start = ctx.tickCount();
-    if (!acceptsPcmInput(rate, channels, format)) return finishWrite(state, r4os.abi.service_api_result_invalid, write_start);
+    if (!acceptsPcmInput(rate, channels, format)) return setLastResult(state, r4os.abi.service_api_result_invalid);
     if (!@atomicLoad(bool, &state.present, .acquire) or !state.dma_ready) {
         logWriteRejectOnce(state, &ctx);
-        return finishWrite(state, -1, write_start);
+        return setLastResult(state, -1);
     }
     releaseCompletedWork(state, &ctx, .task);
     refreshOutputs(state, &ctx);
-    if (!acquireStream(state, &ctx, 100)) return finishWrite(state, -6, write_start);
+    if (!acquireStream(state, &ctx, 100)) return setLastResult(state, -6);
     defer releaseStream(state);
     if (@atomicLoad(bool, &state.shutting_down, .acquire)) {
         logWriteRejectOnce(state, &ctx);
-        return finishWrite(state, -1, write_start);
+        return setLastResult(state, -1);
     }
     if (@atomicLoad(bool, &state.route_transition, .acquire))
-        return finishWrite(state, r4os.abi.service_api_result_busy, write_start);
+        return setLastResult(state, r4os.abi.service_api_result_busy);
     const overlapping_control = @atomicLoad(bool, &state.control_io_active, .acquire);
-    if (!state.output_path_ok) return finishWrite(state, -1, write_start);
+    if (!state.output_path_ok) return setLastResult(state, -1);
     // Initial automatic selection and a recovered stream can reach Write
     // without an explicit output-selection callback. Prime an empty HDMI
     // stream before accepting caller PCM in those paths as well.
     if (!state.playback_started and state.periods.queued == 0 and state.pcm_queue.used == 0 and
-        !prepareSelectedCarrier(state)) return finishWrite(state, -1, write_start);
+        !prepareSelectedCarrier(state)) return setLastResult(state, -1);
     if (@atomicLoad(bool, &state.silent_carrier, .acquire) and ctx.tickCount() < state.carrier_ready_tick)
-        return finishWrite(state, r4os.abi.service_api_result_busy, write_start);
+        return setLastResult(state, r4os.abi.service_api_result_busy);
     const input = data[0..@as(usize, @intCast(len))];
     const output_frames = pcm.outputFrameCount(input.len, rate, channels, format);
     if (output_frames == 0) {
         state.empty_write_count += 1;
-        return finishWrite(state, -2, write_start);
+        return setLastResult(state, -2);
     }
 
     state.last_source_rate = rate;
@@ -2856,13 +2849,13 @@ fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u3
     refreshPlaybackPosition(state, &ctx);
     fillDmaPeriods(state, &ctx);
     if (state.playback_started and bufferedPlaybackPeriods(state) >= targetPeriods(state)) {
-        return finishWrite(state, r4os.abi.service_api_result_busy, write_start);
+        return setLastResult(state, r4os.abi.service_api_result_busy);
     }
     const required_capacity = output_frames * pcm.TARGET_FRAME_BYTES;
     if (required_capacity > state.pcm_queue.free(&state.pcm_queue_storage)) {
         state.queue_overflow_count += 1;
         state.dropped_frame_count +%= output_frames;
-        return finishWrite(state, -3, write_start);
+        return setLastResult(state, -3);
     }
 
     cancelIdleClose(state);
@@ -2871,7 +2864,7 @@ fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u3
     if (pcm.takeDirectChunk(&state.resampler_state, input, rate, channels, format, required_capacity)) |direct| {
         if (!state.pcm_queue.writeAll(&state.pcm_queue_storage, direct)) {
             state.queue_overflow_count += 1;
-            return finishWrite(state, -4, write_start);
+            return setLastResult(state, -4);
         }
         state.last_output_bytes = direct.len;
     } else while (!state.resampler_state.chunk_done) {
@@ -2880,13 +2873,13 @@ fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u3
         if (!state.pcm_queue.writeAll(&state.pcm_queue_storage, scratch[0..converted])) {
             state.queue_overflow_count += 1;
             state.dropped_frame_count +%= (required_capacity - state.last_output_bytes) / pcm.TARGET_FRAME_BYTES;
-            return finishWrite(state, -4, write_start);
+            return setLastResult(state, -4);
         }
         state.last_output_bytes += converted;
     }
     if (state.last_output_bytes == 0) {
         state.empty_write_count += 1;
-        return finishWrite(state, -5, write_start);
+        return setLastResult(state, -5);
     }
 
     state.converted_frame_count +%= state.last_output_bytes / pcm.TARGET_FRAME_BYTES;
@@ -2896,7 +2889,7 @@ fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u3
     state.last_pcm_tick = ctx.tickCount();
     if (@atomicLoad(bool, &state.silent_carrier, .acquire) and !resumeCarrierPcm(state, &ctx)) {
         _ = recoverStream(state, &ctx, "silent carrier resume failed");
-        return finishWrite(state, -1, write_start);
+        return setLastResult(state, -1);
     }
     if (!state.playback_started and state.start_due_tick == 0)
         state.start_due_tick = state.last_pcm_tick +| msTicks(&ctx, 10);
@@ -2912,7 +2905,7 @@ fn writePcmInner(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u3
         };
     }
     if (overlapping_control) _ = @atomicRmw(u64, &state.pcm_during_control, .Add, 1, .monotonic);
-    return finishWrite(state, 0, write_start);
+    return setLastResult(state, 0);
 }
 
 fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
@@ -3274,12 +3267,12 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
         .buffer_bytes = @intCast(state.stream_total_bytes),
         .queued_buffers = @intCast(state.periods.queued),
         .last_buffer_bytes = @intCast(state.last_output_bytes),
-        .last_write_ticks = state.write_last_ticks,
-        .max_write_ticks = state.write_max_ticks,
-        .total_write_ticks = state.write_total_ticks,
-        .last_refill_ticks = state.refill_last_ticks,
-        .max_refill_ticks = state.refill_max_ticks,
-        .total_refill_ticks = state.refill_total_ticks,
+        .last_write_ticks = r4os.abi.audio_duration_ticks_unavailable,
+        .max_write_ticks = r4os.abi.audio_duration_ticks_unavailable,
+        .total_write_ticks = r4os.abi.audio_duration_ticks_unavailable,
+        .last_refill_ticks = r4os.abi.audio_duration_ticks_unavailable,
+        .max_refill_ticks = r4os.abi.audio_duration_ticks_unavailable,
+        .total_refill_ticks = r4os.abi.audio_duration_ticks_unavailable,
     };
     return 0;
 }
@@ -3337,14 +3330,14 @@ fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     while (state.pcm_queue.used >= DMA_BUFFER_BYTES) {
         state.idle_postroll.reset();
         const slot = state.periods.nextWritable() orelse break;
-        const refill_start = ctx.tickCount();
+
         const out = dmaSlice(state, slot) orelse break;
         if (!state.pcm_queue.readExact(&state.pcm_queue_storage, out)) break;
         if (!state.periods.commit(slot)) break;
         if (!state.pcm_cursor.submit(slot, playback_cursor.period_frames)) state.pcm_cursor.available = false;
         state.last_output_buffers += 1;
         state.refill_count +%= 1;
-        recordTickStat(state, &state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
+
     }
     // Both a first short tone and a parked stream lack a completion IRQ.
     // The core's delayed progress callback supplies this observation. Adjacent
@@ -3846,18 +3839,6 @@ fn setLastResult(state: *State, result: i32) i32 {
     return result;
 }
 
-fn finishWrite(state: *State, result: i32, start_tick: u64) i32 {
-    recordTickStat(state, &state.write_total_ticks, &state.write_max_ticks, &state.write_last_ticks, start_tick);
-    return setLastResult(state, result);
-}
-
-fn recordTickStat(state: *State, total: *u64, max: *u64, last: *u64, start_tick: u64) void {
-    const now = context(state).tickCount();
-    const elapsed = if (now >= start_tick) now - start_tick else 0;
-    total.* +%= elapsed;
-    last.* = elapsed;
-    if (elapsed > max.*) max.* = elapsed;
-}
 
 fn noteHdaWarn(state: *State, ctx: *const r4os.r4dev.DriverContext, message: [*:0]const u8) void {
     state.last_error = message;
@@ -4930,4 +4911,78 @@ test "close snapshot rejects changed output reset and controller identities" {
     state.pcm_cursor.current.reset = identity.reset;
     state.info.function = 1;
     try std.testing.expect(!sameDetailEpoch(state, identity));
+}
+
+test "retired PCM detail timing does not read the clock for invalid writes" {
+    const t = @import("std").testing;
+    const Probe = struct {
+        var reads: usize = 0;
+        fn tick() callconv(.c) u64 {
+            reads += 1;
+            return 123;
+        }
+    };
+    Probe.reads = 0;
+    var api: r4os.abi.DriverApi = undefined;
+    api.magic = r4os.abi.driver_magic;
+    api.version = r4os.abi.driver_api_version;
+    api.size = @sizeOf(r4os.abi.DriverApi);
+    api.tick_count = Probe.tick;
+    const bytes = [_]u8{ 1, 2, 3, 4 };
+    var local: State = .{ .api = &api };
+    try t.expectEqual(r4os.abi.service_api_result_invalid, writePcmInner(&local, &bytes, bytes.len, 0, 2, pcm.FORMAT_S16LE, null));
+    try t.expectEqual(@as(i32, r4os.abi.service_api_result_invalid), local.last_result);
+    try t.expectEqual(@as(u64, 1), local.error_count);
+    const empty = r4os.abi.AudioBackendStatus{};
+    const unavailable = r4os.abi.audio_duration_ticks_unavailable;
+    try t.expectEqual(unavailable, empty.last_write_ticks);
+    try t.expectEqual(unavailable, empty.max_write_ticks);
+    try t.expectEqual(unavailable, empty.total_write_ticks);
+    try t.expectEqual(unavailable, empty.last_refill_ticks);
+    try t.expectEqual(unavailable, empty.max_refill_ticks);
+    try t.expectEqual(unavailable, empty.total_refill_ticks);
+    try t.expectEqual(@as(usize, 0), Probe.reads);
+}
+
+test "retired PCM detail timing preserves real refill work without clock reads" {
+    const t = @import("std").testing;
+    const Probe = struct {
+        var reads: usize = 0;
+        fn tick() callconv(.c) u64 {
+            reads += 1;
+            return 123;
+        }
+    };
+    Probe.reads = 0;
+    var api: r4os.abi.DriverApi = undefined;
+    api.magic = r4os.abi.driver_magic;
+    api.version = r4os.abi.driver_api_version;
+    api.size = @sizeOf(r4os.abi.DriverApi);
+    api.tick_count = Probe.tick;
+    var dma: [DMA_RING_BYTES]u8 = @splat(0xAA);
+    var input: [DMA_BUFFER_BYTES]u8 = undefined;
+    for (&input, 0..) |*byte, i| byte.* = @truncate(i * 73 + 19);
+    var local: State = .{
+        .api = &api,
+        .playback_started = true,
+        .stream_dma = .{ .virt_addr = @intFromPtr(&dma), .bytes = dma.len },
+        .periods = stream_ring.PeriodBook.init(DMA_BUFFER_COUNT),
+    };
+    local.periods.running = true;
+    local.periods.producer = 1; // Current DMA slot0 must remain untouched.
+    try t.expect(local.pcm_cursor.accept(playback_cursor.period_frames));
+    try t.expect(local.pcm_queue.writeAll(&local.pcm_queue_storage, &input));
+    const ctx = context(&local);
+    fillDmaPeriods(&local, &ctx);
+    try t.expectEqual(@as(usize, 0), local.pcm_queue.used);
+    try t.expectEqual(@as(usize, 1), local.periods.queued);
+    try t.expect(local.periods.ready[1] and !local.periods.ready[0]);
+    try t.expectEqualSlices(u8, &input, dma[DMA_BUFFER_BYTES .. 2 * DMA_BUFFER_BYTES]);
+    for (dma[0..DMA_BUFFER_BYTES]) |byte| try t.expectEqual(@as(u8, 0xAA), byte);
+    try t.expectEqual(@as(u64, 1), local.refill_count);
+    try t.expect(local.pcm_cursor.available);
+    try t.expectEqual(@as(u64, 480), local.pcm_cursor.current.accepted);
+    try t.expectEqual(@as(u64, 480), local.pcm_cursor.current.submitted);
+    try t.expectEqual(@as(u64, 0), local.pcm_cursor.current.consumed);
+    try t.expectEqual(@as(usize, 0), Probe.reads);
 }
