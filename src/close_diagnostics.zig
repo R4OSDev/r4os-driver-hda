@@ -2,7 +2,7 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const a = r4os.abi;
-const Semaphores = @typeInfo(@TypeOf(@as(*const r4os.r4dev.DriverContext, undefined).semaphores())).optional.child;
+const Semaphores = @typeInfo(@TypeOf(@as(*const r4os.r4dev.DriverContext2, undefined).semaphores())).optional.child;
 
 pub const max_body_bytes = 512;
 pub const max_lines = 32;

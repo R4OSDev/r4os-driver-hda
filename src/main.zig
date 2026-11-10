@@ -22,7 +22,7 @@ const playback_cursor = @import("playback_cursor.zig");
 const amd_hdmi = @import("amd_hdmi.zig");
 
 comptime {
-    asm (r4os.r4dev.driverEntriesAsm("hda_init", "hda_shutdown"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.driverEntriesAsm("hda_init", "hda_shutdown"));
 }
 
 const CLASS_MULTIMEDIA: u8 = 0x04;
@@ -318,7 +318,7 @@ const RirbEntry = extern struct {
 };
 
 const State = struct {
-    api: *const r4os.r4dev.DriverApi = undefined,
+    api: *const r4os.abi.DriverApi2 = undefined,
     backend_name: [32:0]u8 = .{0} ** 32,
     pcm_queue_storage: [PCM_QUEUE_BYTES]u8 = undefined,
     route_program_plan: codec_program.ProgramPlan = .{},
@@ -330,8 +330,11 @@ const State = struct {
     controller_rejected_count: u8 = 0,
     controller_candidates: [MAX_CONTROLLER_CANDIDATES]ControllerCandidateSnapshot = .{ControllerCandidateSnapshot{}} ** MAX_CONTROLLER_CANDIDATES,
     selected_inventory_index: u32 = ~@as(u32, 0),
-    backend: r4os.r4dev.AudioOutputPlaybackBackend = .{
-        .base = .{ .base = .{ .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput } }, .idle = idlePlaybackBackend },
+    backend: r4os.abi.AudioBackend2 = .{
+        .output_query = queryOutput,
+        .output_select = selectOutput,
+        .output_active = activeOutput,
+        .idle = idlePlaybackBackend,
         .write_tracked = writePcmTracked,
         .playback = backendPlayback,
         .flow = backendFlow,
@@ -657,15 +660,15 @@ var controller_count: usize = 0;
 
 // 0.56.40: hz-neutrale Laufzeit-Umrechnung (R4D kennt DEFAULT_HZ nicht
 // comptime; timerFrequency liefert die echte Tickrate).
-fn msTicks(ctx: *const r4os.r4dev.DriverContext, ms: u64) u64 {
+fn msTicks(ctx: *const r4os.r4dev.DriverContext2, ms: u64) u64 {
     const freq = @as(u64, ctx.timerFrequency());
     if (freq == 0) return @max(1, ms / 10);
     return @max(1, (ms * freq) / 1000);
 }
 
-export fn hda_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
-    const ctx = r4os.r4dev.DriverContext.init(api);
-    if (!ctx.apiCompatible() or api.version < r4os.abi.driver_api_continuation_work_version) return -10;
+export fn hda_init(api: *const r4os.abi.DriverApi2) callconv(.c) i32 {
+    const ctx = r4os.r4dev.DriverContext2.init(api);
+    if (!ctx.requires(.{ "alloc_dma_region_constrained", "driver_completion_release", "driver_completion_status", "driver_completion_wait", "driver_work_cancel", "driver_work_submit", "driver_work_submit_request", "free_dma_region", "get_option", "irq_register", "irq_unregister", "pci_device_count", "pci_disable_msi", "pci_enable_bus_master", "pci_enable_msi", "pci_find_by_class", "pci_map_bar", "pci_read_config32", "pci_write_config32", "register_audio_output_backend", "tick_count", "timer_frequency", "unregister_audio_backend", "wait_ticks" })) return -10;
     diagnostic_owner.configure(optionEnabled(&ctx, "details"));
     controller_count = 0;
     var start: u32 = 0;
@@ -710,7 +713,7 @@ export fn hda_shutdown() callconv(.c) i32 {
     return if (success) 0 else -1;
 }
 
-fn initController(state: *State, api: *const r4os.r4dev.DriverApi, info: r4os.abi.PciDeviceInfo, inventory_index: u32) i32 {
+fn initController(state: *State, api: *const r4os.abi.DriverApi2, info: r4os.abi.PciDeviceInfo, inventory_index: u32) i32 {
     state.* = .{ .api = api };
     state.selected_inventory_index = inventory_index;
     var name_len: usize = 0;
@@ -783,7 +786,7 @@ fn initController(state: *State, api: *const r4os.r4dev.DriverApi, info: r4os.ab
     return 0;
 }
 
-fn initializeControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, info: r4os.abi.PciDeviceInfo) bool {
+fn initializeControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext2, info: r4os.abi.PciDeviceInfo) bool {
     state.stage = .pci;
     state.info = info;
     logDevice(ctx, info);
@@ -861,7 +864,7 @@ fn collectControllerEvidence(state: *State, inventory_index: u32) controller_pol
 }
 
 const CoherencyIo = struct {
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     info: r4os.abi.PciDeviceInfo,
 
     pub fn read(self: *const CoherencyIo, offset: u16) u32 {
@@ -873,7 +876,7 @@ const CoherencyIo = struct {
     }
 };
 
-fn logCoherency(state: *State, ctx: *const r4os.r4dev.DriverContext, phase: []const u8) void {
+fn logCoherency(state: *State, ctx: *const r4os.r4dev.DriverContext2, phase: []const u8) void {
     const original = state.coherency.original orelse return;
     const observed = state.coherency.observed orelse return;
     var line: [240:0]u8 = undefined;
@@ -895,7 +898,7 @@ fn logCoherency(state: *State, ctx: *const r4os.r4dev.DriverContext, phase: []co
     logLine(ctx, &line, len);
 }
 
-fn cleanupControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, restore_command: bool) bool {
+fn cleanupControllerCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext2, restore_command: bool) bool {
     if (state.mmio.virt_addr != 0) write32(mmioBase(state) + REG_INTCTL, 0);
     if (!shutdownCommandTransport(state, ctx)) return false;
     const pci_coherency = CoherencyIo{ .ctx = ctx, .info = state.info };
@@ -1005,7 +1008,7 @@ fn decodeCapabilities(state: *State) void {
     state.codec_count = countBits16(state.codec_mask);
 }
 
-fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     const base = mmioBase(state);
     ctx.logInfo("HDA.R4D reset controller");
     write32(base + REG_INTCTL, 0);
@@ -1037,10 +1040,11 @@ fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     const start = ctx.tickCount();
     const span = msTicks(ctx, CODEC_WAKE_TIMEOUT_MS);
     var codec_mask: u16 = 0;
+    var wake_steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while (true) {
         codec_mask = read16(base + REG_STATESTS) & 0x7FFF;
         if (codec_mask != 0) break;
-        if (controller_reset.expired(start, ctx.tickCount(), span)) break;
+        if (wake_steps.step(null, false) != .proceed or controller_reset.expired(start, ctx.tickCount(), span)) break;
         ctx.waitTicks(1);
     }
     state.gctl = read32(base + REG_GCTL);
@@ -1056,7 +1060,7 @@ fn resetController(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn setupCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (state.codec_mask == 0) {
         ctx.logWarn("HDA.R4D no codecs in STATESTS");
         return false;
@@ -1092,7 +1096,7 @@ fn setupCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext) bo
     return false;
 }
 
-fn setupCorbRirb(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupCorbRirb(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     const base = mmioBase(state);
     write8(base + REG_RIRBCTL, 0);
     write8(base + REG_CORBCTL, 0);
@@ -1173,12 +1177,12 @@ fn setupCorbRirb(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn setupImmediateTransport(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8) ?u32 {
+fn setupImmediateTransport(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8) ?u32 {
     state.transport_mode = .immediate;
     return sendImmediateVerb(state, ctx, makeVerb(codec, 0, 0xF00, PARAM_VENDOR_ID));
 }
 
-fn shutdownCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (state.mmio.virt_addr != 0) {
         const base = mmioBase(state);
         write8(base + REG_RIRBCTL, 0);
@@ -1206,7 +1210,7 @@ fn shutdownCommandTransport(state: *State, ctx: *const r4os.r4dev.DriverContext)
     return true;
 }
 
-fn discoverCodecs(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn discoverCodecs(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     clearCodecInfo(state);
     var complete = true;
     var any = false;
@@ -1225,7 +1229,7 @@ fn discoverCodecs(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return state.codec_ready;
 }
 
-fn discoverCodec(state: *State, ctx: *const r4os.r4dev.DriverContext, addr: u8) bool {
+fn discoverCodec(state: *State, ctx: *const r4os.r4dev.DriverContext2, addr: u8) bool {
     const info = &state.codecs[@intCast(addr)];
     info.* = .{};
     info.present = true;
@@ -1363,7 +1367,7 @@ fn discoverWidgetConnections(state: *State, addr: u8, info: *CodecInfo) bool {
     return true;
 }
 
-fn chooseOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn chooseOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     state.output = .{};
     state.output_routes = .{OutputCandidate{}} ** 4;
     state.output_count = 0;
@@ -1460,7 +1464,7 @@ fn outputRouteIndex(role: codec_program.PinRole) usize {
     return @intFromEnum(role);
 }
 
-fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8) hdmi.Sink {
+fn readHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8, pin: u8) hdmi.Sink {
     const location = (@as(u32, state.info.bus_kind) << 24) | (@as(u32, state.info.bus) << 8) |
         (@as(u32, state.info.device) << 3) | state.info.function;
     const device = @as(u32, state.info.vendor_id) | (@as(u32, state.info.device_id) << 16);
@@ -1527,7 +1531,7 @@ fn amdDisplayCodec(state: *const State, codec: u8) bool {
 }
 const AmdSinkReader = struct {
     state: *State,
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     codec: u8,
     pin: u8,
     deadline: u64,
@@ -1536,7 +1540,7 @@ const AmdSinkReader = struct {
         return sendVerb(self.state, makeVerb(self.codec, self.pin, command, value));
     }
 };
-fn readAmdSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, location: u32, device: u32) hdmi.Sink {
+fn readAmdSink(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8, pin: u8, location: u32, device: u32) hdmi.Sink {
     const outputs = state.display_audio orelse return .{ .availability = .waiting_for_eld };
     // AMD has no standard ELD byte reader. Never trust firmware-only pin
     // presence without this exact driver/source generation and vendor readback.
@@ -1558,7 +1562,7 @@ fn readAmdSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, p
     return .{ .availability = .waiting_for_eld };
 }
 
-fn logHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, pin: u8, sink: hdmi.Sink) void {
+fn logHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8, pin: u8, sink: hdmi.Sink) void {
     var line: [192:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.HDMI pci=");
@@ -1578,7 +1582,7 @@ fn logHdmiSink(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, p
     logLine(ctx, &line, len);
 }
 
-fn readHeadphoneSense(state: *State, ctx: *const r4os.r4dev.DriverContext) codec_program.JackSense {
+fn readHeadphoneSense(state: *State, ctx: *const r4os.r4dev.DriverContext2) codec_program.JackSense {
     const candidate = state.output_routes[outputRouteIndex(.headphone)];
     if (!candidate.found or
         (candidate.pin_caps & PIN_CAP_PRESENCE_DETECT) == 0 or
@@ -1617,7 +1621,7 @@ fn clearOutputPath(state: *State) void {
     state.output_program_operations = 0;
 }
 
-fn configureOutputPath(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn configureOutputPath(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     clearOutputPath(state);
     if (!state.output.found) {
         state.output_path_fail_count += 1;
@@ -1671,7 +1675,7 @@ fn buildOutputPlan(state: *State, candidate: OutputCandidate) ?codec_program.Pro
     return codec_program.buildPlan(&input);
 }
 
-fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, candidate: OutputCandidate) bool {
+fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext2, candidate: OutputCandidate) bool {
     const changed_output = state.output.codec != candidate.codec or state.output.pin != candidate.pin or
         state.output.converter != candidate.converter or !hdmi.sameReceiver(state.output.sink, candidate.sink);
     if (candidate.role == .hdmi) {
@@ -1713,7 +1717,7 @@ fn programOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, c
     return true;
 }
 
-fn executeOutputOperation(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, operation: codec_program.Operation) bool {
+fn executeOutputOperation(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8, operation: codec_program.Operation) bool {
     return switch (operation.kind) {
         .set_power_d0 => sendVerb(state, makeVerb(codec, operation.node, VERB_SET_POWER_STATE, 0)) != null,
         .verify_power_d0 => waitPowerD0(state, ctx, codec, operation.node),
@@ -1757,9 +1761,11 @@ fn executeOutputOperation(state: *State, ctx: *const r4os.r4dev.DriverContext, c
     };
 }
 
-fn waitPowerD0(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, node: u8) bool {
+fn waitPowerD0(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8, node: u8) bool {
     const deadline = ctx.tickCount() +| msTicks(ctx, COMMAND_TIMEOUT_MS);
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(msTicks(ctx, COMMAND_TIMEOUT_MS) +| 8, .task);
     while (true) {
+        if (steps.step(null, false) != .proceed) return false;
         const response = sendVerb(state, makeVerb(codec, node, VERB_GET_POWER_STATE, 0)) orelse return false;
         if ((response & 0x100) != 0) return false;
         if (((response >> 4) & 0x0f) == 0) return true;
@@ -1785,7 +1791,7 @@ fn deactivateOutputCandidate(state: *State, candidate: OutputCandidate) bool {
     return converter_stopped and pin_disabled and digital_stopped;
 }
 
-fn switchOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, candidate: OutputCandidate) bool {
+fn switchOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext2, candidate: OutputCandidate) bool {
     if (!candidate.found) return false;
     if (state.output_path_ok and state.output.found and state.output.codec == candidate.codec and state.output.pin == candidate.pin and state.output.converter == candidate.converter) return true;
     const previous = state.output;
@@ -1805,7 +1811,7 @@ fn switchOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext, ca
     return false;
 }
 
-fn pollJackAndSwitch(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn pollJackAndSwitch(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (@atomicLoad(bool, &state.explicit_output, .acquire) or state.output.role == .hdmi) return;
     if (!state.jack_poll_supported) return;
     const now = ctx.tickCount();
@@ -1840,7 +1846,7 @@ fn pollJackAndSwitch(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
-fn setupStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     state.dma_ready = false;
     if (state.output_count == 0) return false;
     const candidate = if (state.output.found) state.output else state.output_catalog[0];
@@ -1889,7 +1895,7 @@ fn setupStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn setupPositionDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupPositionDma(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     state.position_dma_enabled = false;
     state.position_dma_degraded = false;
     state.position_degradation = .dma_unavailable;
@@ -1950,7 +1956,7 @@ fn setupPositionDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn shutdownPositionDma(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn shutdownPositionDma(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (state.mmio.virt_addr != 0) {
         write32(mmioBase(state) + REG_DPLBASE, 0);
         write32(mmioBase(state) + REG_DPUBASE, 0);
@@ -1964,7 +1970,7 @@ fn shutdownPositionDma(state: *State, ctx: *const r4os.r4dev.DriverContext) void
     state.position_dma_enabled = false;
 }
 
-fn allocStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn allocStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     const max_phys_addr: u64 = if (state.dma_64bit_supported) ~@as(u64, 0) else 0xFFFF_FFFF;
     if (state.stream_bdl.phys_addr == 0) {
         if (ctx.allocDmaRegionConstrained(@intCast(@sizeOf(BdlEntry) * DMA_BUFFER_COUNT), 128, max_phys_addr, &state.stream_bdl) != 0) return false;
@@ -1980,7 +1986,7 @@ fn allocStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn resetStreamDescriptor(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn resetStreamDescriptor(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     cancelIdleClose(state);
     state.reset_stream_count += 1;
     const control = read32(state.stream_desc_base + SD_CTL);
@@ -2081,7 +2087,7 @@ fn programStreamDescriptorRegisters(state: *State) void {
     write8(state.stream_desc_base + SD_STS, SD_STS_CLEAR);
 }
 
-fn setupInterrupts(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn setupInterrupts(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     state.irq_registered = false;
     state.irq_mode = 0;
     state.irq_route_count = 0;
@@ -2133,7 +2139,7 @@ fn setupInterrupts(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn registerIrqRoute(state: *State, ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
+fn registerIrqRoute(state: *State, ctx: *const r4os.r4dev.DriverContext2, route: u8) bool {
     if (route >= 32 or state.irq_route_count >= state.irq_routes.len) return false;
     var index: usize = 0;
     while (index < state.irq_route_count) : (index += 1) {
@@ -2154,7 +2160,7 @@ fn disableInterrupts(state: *State) void {
     }
 }
 
-fn unregisterInterrupts(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn unregisterInterrupts(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     const used_msi = state.irq_mode == 2;
     var remaining: usize = 0;
     var index: usize = 0;
@@ -2215,7 +2221,7 @@ fn scheduleRefillWork(s: *State) void {
     if (!work_gate.maySchedule(&s.shutting_down, &s.synchronous_stop)) return;
     if (@atomicRmw(bool, &s.work_pending, .Xchg, true, .acq_rel)) return;
     @atomicStore(bool, &s.refill_waiting, false, .release);
-    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    const ctx = r4os.r4dev.DriverContext2.init(s.api);
     var free_index: ?usize = null;
     for (s.work_handles[0..WORK_HANDLE_CAPACITY], 0..) |*handle, index| {
         if (@atomicLoad(u32, handle, .acquire) == 0) {
@@ -2252,7 +2258,7 @@ fn scheduleRefillWork(s: *State) void {
 fn refillWork(raw_context: usize) callconv(.c) i32 {
     const s: *State = @ptrFromInt(raw_context);
     const state = s;
-    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    const ctx = r4os.r4dev.DriverContext2.init(s.api);
     releaseCompletedWork(state, &ctx, .worker);
     const observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
     var completed = false;
@@ -2298,7 +2304,7 @@ fn finishRefillTransition(state: *State) i32 {
     return 0;
 }
 
-fn releaseCompletedWork(state: *State, ctx: *const r4os.r4dev.DriverContext, reap_context: irq_recovery.ReapContext) void {
+fn releaseCompletedWork(state: *State, ctx: *const r4os.r4dev.DriverContext2, reap_context: irq_recovery.ReapContext) void {
     if (!state.completion_reap_gate.tryClaim(reap_context)) return;
     defer state.completion_reap_gate.release();
     for (&state.work_handles, 0..) |*stored, index| {
@@ -2315,7 +2321,7 @@ fn releaseCompletedWork(state: *State, ctx: *const r4os.r4dev.DriverContext, rea
     syncWorkOwnership(state);
 }
 
-fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     @atomicStore(bool, &state.control_quiescing, true, .release);
     defer @atomicStore(bool, &state.control_quiescing, false, .release);
     @atomicStore(bool, &state.work_pending, false, .release);
@@ -2356,7 +2362,7 @@ fn releaseDriverWork(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return quiesced;
 }
 
-fn releaseIdleRefillWork(state: *State, ctx: *const r4os.r4dev.DriverContext) idle_drain.Retirement {
+fn releaseIdleRefillWork(state: *State, ctx: *const r4os.r4dev.DriverContext2) idle_drain.Retirement {
     if (!state.completion_reap_gate.tryClaim(.task)) return .pending;
     defer state.completion_reap_gate.release();
     defer syncWorkOwnership(state);
@@ -2393,7 +2399,7 @@ fn syncWorkOwnership(state: *State) void {
     _ = state.lifecycle.releaseAtomic(.work);
 }
 
-fn waitRunClear(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn waitRunClear(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) == 0) return true;
     const deadline = ctx.tickCount() + msTicks(ctx, RUN_CLEAR_TIMEOUT_MS);
     while ((read32(state.stream_desc_base + SD_CTL) & SD_CTL_RUN) != 0) {
@@ -2403,10 +2409,15 @@ fn waitRunClear(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
-    state.backend.base.base.base = .{
-        .version = r4os.abi.audio_backend_playback_version,
-        .size = @sizeOf(r4os.r4dev.AudioOutputPlaybackBackend),
+fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
+    state.backend = .{
+        .output_query = queryOutput,
+        .output_select = selectOutput,
+        .output_active = activeOutput,
+        .idle = idlePlaybackBackend,
+        .write_tracked = writePcmTracked,
+        .playback = backendPlayback,
+        .flow = backendFlow,
         .formats = r4os.abi.audio_backend_format_s16le | r4os.abi.audio_backend_format_u8,
         .min_rate = MIN_RATE,
         .max_rate = MAX_RATE,
@@ -2418,7 +2429,7 @@ fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) 
         .shutdown = shutdownBackend,
         .status = backendStatus,
     };
-    const rc = ctx.registerAudioOutputPlayback(&state.backend_name, &state.backend);
+    const rc = ctx.registerAudioOutputBackend(&state.backend_name, &state.backend);
     state.last_result = rc;
     if (rc != 0) {
         _ = @atomicRmw(u64, &state.error_count, .Add, 1, .monotonic);
@@ -2434,7 +2445,7 @@ fn registerPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) 
     return true;
 }
 
-fn unregisterPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn unregisterPlaybackBackend(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!state.backend_registered) return true;
     if (ctx.unregisterAudioBackend(&state.backend_name) != 0) return false;
     state.backend_registered = false;
@@ -2448,7 +2459,7 @@ fn acceptsPcmInput(rate: u32, channels: u16, format: u16) bool {
     return format == pcm.FORMAT_S16LE or format == pcm.FORMAT_U8;
 }
 
-fn refreshOutputs(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn refreshOutputs(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (!state.control_has_hdmi and (!state.jack_poll_supported or @atomicLoad(bool, &state.explicit_output, .acquire))) return;
     if (ctx.tickCount() < @atomicLoad(u64, &state.output_poll_tick, .acquire)) return;
     scheduleControlWork(state);
@@ -2476,7 +2487,7 @@ fn scheduleControlWork(state: *State) void {
     @atomicStore(bool, &state.control_pending, false, .release);
 }
 
-fn acquireControl(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn acquireControl(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     const deadline = ctx.tickCount() +| msTicks(ctx, 100);
     while (@atomicRmw(bool, &state.control_lock, .Xchg, true, .acq_rel)) {
         if (ctx.tickCount() >= deadline) return false;
@@ -2507,7 +2518,7 @@ fn continuingControl(state: *const State) bool {
 
 const EldReader = struct {
     state: *State,
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     codec: u8,
     pin: u8,
     verbs: *u64,
@@ -2623,7 +2634,7 @@ fn controlWork(raw: usize) callconv(.c) i32 {
     return 0;
 }
 
-fn publishControlSnapshot(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn publishControlSnapshot(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!tryAcquireStream(state)) return false;
     if (state.published_snapshot_generation != state.control_snapshot.generation) state.catalog_epoch.advance();
     for (state.output_catalog[0..state.output_count], 0..) |*candidate, index| {
@@ -2942,7 +2953,7 @@ fn cancelIdleClose(state: *State) void {
 
 const IdleCloseOwner = struct {
     state: *State,
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     pub fn identity(self: *@This()) idle_drain.Identity {
         return .{ .output = self.state.pcm_cursor.current.output, .reset = self.state.pcm_cursor.current.reset };
     }
@@ -3053,7 +3064,7 @@ fn sameDetailEpoch(state: *const State, expected: close_diagnostics.Identity) bo
 // Keep the copied snapshot and formatting buffers out of a normal Close frame.
 // The diagnostic permit is acquired with no stream owner held. Revalidate the
 // exact event after reacquiring that owner; never label a newer route as Close.
-noinline fn logCompletionDetails(state: *State, ctx: *const r4os.r4dev.DriverContext, expected: close_diagnostics.Identity, phase: []const u8) void {
+noinline fn logCompletionDetails(state: *State, ctx: *const r4os.r4dev.DriverContext2, expected: close_diagnostics.Identity, phase: []const u8) void {
     const ticket = diagnostic_owner.begin(ctx, msTicks(ctx, 100)) orelse return;
     defer _ = ticket.release(ctx);
     if (!acquireStream(state, ctx, 100)) {
@@ -3069,7 +3080,7 @@ noinline fn logCompletionDetails(state: *State, ctx: *const r4os.r4dev.DriverCon
     var captured_identity = expected;
     captured_identity.tick = ctx.tickCount();
     releaseStream(state);
-    var emitter = close_diagnostics.Emitter(r4os.r4dev.DriverContext).begin(ctx, ticket, captured_identity, phase);
+    var emitter = close_diagnostics.Emitter(r4os.r4dev.DriverContext2).begin(ctx, ticket, captured_identity, phase);
     logControlSummary(&snapshot, &emitter);
     logControllerSelectionEvidence(&snapshot, &emitter);
     logDiagnosticCore(&snapshot, &emitter);
@@ -3165,7 +3176,7 @@ fn enterSilentCarrier(state: *State) bool {
     return true;
 }
 
-fn resumeCarrierPcm(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn resumeCarrierPcm(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     const control = read32(state.stream_desc_base + SD_CTL);
     const status = read8(state.stream_desc_base + SD_STS);
     if ((control & SD_CTL_RUN) == 0 or (status & (SD_STS_FIFOE | SD_STS_DESE)) != 0) return false;
@@ -3187,7 +3198,7 @@ fn resumeCarrierPcm(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
 }
 
 fn logControlSummary(state: anytype, ctx: anytype) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 240 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 240 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.CONTROL polls=");
     appendDec(&line, &len, @atomicLoad(u64, &state.control_polls, .acquire));
@@ -3216,7 +3227,7 @@ fn logControlSummary(state: anytype, ctx: anytype) void {
 }
 
 fn logCarrierSummary(state: anytype, ctx: anytype) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 240 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 240 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.CARRIER quiet=");
     appendDec(&line, &len, @intFromBool(@atomicLoad(bool, &state.silent_carrier, .acquire)));
@@ -3239,7 +3250,7 @@ fn shutdownBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     return setLastResult(state, if (shutdownHardware(state, &ctx)) 0 else -1);
 }
 
-fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) callconv(.c) i32 {
+fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus2) callconv(.c) i32 {
     const state: *State = @ptrCast(@alignCast(context_arg orelse return -1));
     out.* = .{};
     const ctx = context(state);
@@ -3267,12 +3278,6 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
         .buffer_bytes = @intCast(state.stream_total_bytes),
         .queued_buffers = @intCast(state.periods.queued),
         .last_buffer_bytes = @intCast(state.last_output_bytes),
-        .last_write_ticks = r4os.abi.audio_duration_ticks_unavailable,
-        .max_write_ticks = r4os.abi.audio_duration_ticks_unavailable,
-        .total_write_ticks = r4os.abi.audio_duration_ticks_unavailable,
-        .last_refill_ticks = r4os.abi.audio_duration_ticks_unavailable,
-        .max_refill_ticks = r4os.abi.audio_duration_ticks_unavailable,
-        .total_refill_ticks = r4os.abi.audio_duration_ticks_unavailable,
     };
     return 0;
 }
@@ -3325,7 +3330,7 @@ fn targetPeriods(state: *const State) usize {
     return @max(1, (@as(usize, state.source_flow.high_water_frames) + playback_cursor.period_frames - 1) / playback_cursor.period_frames);
 }
 
-fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (@atomicLoad(bool, &state.silent_carrier, .acquire)) return;
     while (state.pcm_queue.used >= DMA_BUFFER_BYTES) {
         state.idle_postroll.reset();
@@ -3337,7 +3342,6 @@ fn fillDmaPeriods(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
         if (!state.pcm_cursor.submit(slot, playback_cursor.period_frames)) state.pcm_cursor.available = false;
         state.last_output_buffers += 1;
         state.refill_count +%= 1;
-
     }
     // Both a first short tone and a parked stream lack a completion IRQ.
     // The core's delayed progress callback supplies this observation. Adjacent
@@ -3357,7 +3361,7 @@ fn bufferedPlaybackPeriods(state: *State) usize {
     return (queued_bytes + DMA_BUFFER_BYTES - 1) / DMA_BUFFER_BYTES;
 }
 
-fn flushTailPeriod(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn flushTailPeriod(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (state.pcm_queue.used == 0) return true;
     refreshPlaybackPosition(state, ctx);
     return commitTailPeriod(state);
@@ -3398,7 +3402,7 @@ fn updateStreamStatus(state: *State) void {
     state.stream_lpib_last = read32(state.stream_desc_base + SD_LPIB);
 }
 
-fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (!state.playback_started or state.stream_total_bytes == 0) return;
     state.poll_count +%= 1;
     const now = ctx.tickCount();
@@ -3489,7 +3493,7 @@ fn refreshPlaybackPosition(state: *State, ctx: *const r4os.r4dev.DriverContext) 
     }
 }
 
-fn parkEmptyPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn parkEmptyPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!state.playback_started or state.periods.queued != 0) return false;
     if (carrierEligible(state)) return enterSilentCarrier(state);
     // Stop DMA and completion IRQs before resetting ownership. Keep the
@@ -3518,7 +3522,7 @@ fn readPositionDma(state: *State) ?u32 {
     return ptr.*;
 }
 
-fn updatePositionSource(state: *State, ctx: *const r4os.r4dev.DriverContext, choice: stream_hardware.PositionChoice) void {
+fn updatePositionSource(state: *State, ctx: *const r4os.r4dev.DriverContext2, choice: stream_hardware.PositionChoice) void {
     state.position_source = choice.source;
     if (state.position_dma_degraded) return;
     state.position_degradation = choice.degradation;
@@ -3550,7 +3554,7 @@ fn updatePositionSource(state: *State, ctx: *const r4os.r4dev.DriverContext, cho
 
 fn recoverPositionFailure(
     state: *State,
-    ctx: *const r4os.r4dev.DriverContext,
+    ctx: *const r4os.r4dev.DriverContext2,
     reason: [*:0]const u8,
     failure: stream_hardware.ProgressFailure,
 ) void {
@@ -3584,7 +3588,7 @@ fn startPlaybackIfNeeded(state: *State) void {
     updateStreamStatus(state);
 }
 
-fn drainPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn drainPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     if (!state.playback_started and state.periods.queued == 0 and state.pcm_queue.used == 0) return true;
     state.drain_count += 1;
     state.draining = true;
@@ -3619,7 +3623,7 @@ fn drainPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
     return drained;
 }
 
-fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
+fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext2, drain: bool) bool {
     cancelIdleClose(state);
     if (!state.dma_ready or state.stream_desc_base == 0) return true;
     // The stream owner advances DMA itself through Drain and descriptor reset.
@@ -3672,7 +3676,7 @@ fn stopPlayback(state: *State, ctx: *const r4os.r4dev.DriverContext, drain: bool
     return true;
 }
 
-fn recoverStream(state: *State, ctx: *const r4os.r4dev.DriverContext, reason: [*:0]const u8) bool {
+fn recoverStream(state: *State, ctx: *const r4os.r4dev.DriverContext2, reason: [*:0]const u8) bool {
     if (!state.dma_ready) return false;
     state.stream_recovery_count += 1;
     state.last_recovery = reason;
@@ -3698,7 +3702,7 @@ fn recoverStream(state: *State, ctx: *const r4os.r4dev.DriverContext, reason: [*
     return true;
 }
 
-fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext) bool {
+fn shutdownHardware(state: *State, ctx: *const r4os.r4dev.DriverContext2) bool {
     @atomicStore(i32, &state.active_output_index, -1, .release);
     @atomicStore(bool, &state.shutting_down, true, .release);
     @atomicStore(bool, &state.present, false, .release);
@@ -3803,10 +3807,13 @@ fn tryAcquireStream(state: *State) bool {
     return !@atomicRmw(bool, &state.stream_lock, .Xchg, true, .acq_rel);
 }
 
-fn acquireStream(state: *State, ctx: *const r4os.r4dev.DriverContext, timeout_ms: u64) bool {
+fn acquireStream(state: *State, ctx: *const r4os.r4dev.DriverContext2, timeout_ms: u64) bool {
     if (tryAcquireStream(state)) return true;
-    const deadline = ctx.tickCount() + msTicks(ctx, timeout_ms);
+    const span = msTicks(ctx, timeout_ms);
+    const deadline = ctx.tickCount() +| span;
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while (ctx.tickCount() < deadline) {
+        if (steps.step(null, false) != .proceed) return false;
         ctx.waitTicks(1);
         if (tryAcquireStream(state)) return true;
     }
@@ -3839,8 +3846,7 @@ fn setLastResult(state: *State, result: i32) i32 {
     return result;
 }
 
-
-fn noteHdaWarn(state: *State, ctx: *const r4os.r4dev.DriverContext, message: [*:0]const u8) void {
+fn noteHdaWarn(state: *State, ctx: *const r4os.r4dev.DriverContext2, message: [*:0]const u8) void {
     state.last_error = message;
     ctx.logWarn(message);
 }
@@ -3949,7 +3955,7 @@ fn sendCorbVerb(state: *State, verb: u32) ?u32 {
     return null;
 }
 
-fn sendImmediateVerb(state: *State, ctx: *const r4os.r4dev.DriverContext, verb: u32) ?u32 {
+fn sendImmediateVerb(state: *State, ctx: *const r4os.r4dev.DriverContext2, verb: u32) ?u32 {
     const base = mmioBase(state);
     if (!wait16ClearTimed(ctx, base + REG_ICIS, ICIS_BUSY, COMMAND_TIMEOUT_MS)) {
         _ = @atomicRmw(u64, &state.timeout_count, .Add, 1, .monotonic);
@@ -4044,12 +4050,12 @@ fn countBits16(value: u16) u8 {
     return count;
 }
 
-fn optionEnabled(ctx: *const r4os.r4dev.DriverContext, key: [*:0]const u8) bool {
+fn optionEnabled(ctx: *const r4os.r4dev.DriverContext2, key: [*:0]const u8) bool {
     const value = ctx.getOption("HDA", key);
     return zEq(value, "1") or zEq(value, "yes") or zEq(value, "true") or zEq(value, "on");
 }
 
-fn optionDisabled(ctx: *const r4os.r4dev.DriverContext, key: [*:0]const u8) bool {
+fn optionDisabled(ctx: *const r4os.r4dev.DriverContext2, key: [*:0]const u8) bool {
     const value = ctx.getOption("HDA", key);
     return zEq(value, "0") or zEq(value, "no") or zEq(value, "false") or zEq(value, "off") or zEq(value, "disabled");
 }
@@ -4082,8 +4088,8 @@ fn initFailureCode(stage: InitStage) i32 {
     };
 }
 
-fn context(state: *State) r4os.r4dev.DriverContext {
-    return r4os.r4dev.DriverContext.init(state.api);
+fn context(state: *State) r4os.r4dev.DriverContext2 {
+    return r4os.r4dev.DriverContext2.init(state.api);
 }
 
 fn read8(addr: u64) u8 {
@@ -4120,73 +4126,82 @@ fn dmaBarrier() void {
     asm volatile ("mfence" ::: .{ .memory = true });
 }
 
-fn wait8ClearTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u8, timeout_ms: u64) bool {
+fn wait8ClearTimed(ctx: *const r4os.r4dev.DriverContext2, addr: u64, mask: u8, timeout_ms: u64) bool {
     const start = ctx.tickCount();
     const span = msTicks(ctx, timeout_ms);
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while ((read8(addr) & mask) != 0) {
-        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        if (steps.step(null, false) != .proceed or controller_reset.expired(start, ctx.tickCount(), span)) return false;
         ctx.waitTicks(1);
     }
     return true;
 }
 
-fn wait8SetTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u8, timeout_ms: u64) bool {
+fn wait8SetTimed(ctx: *const r4os.r4dev.DriverContext2, addr: u64, mask: u8, timeout_ms: u64) bool {
     const start = ctx.tickCount();
     const span = msTicks(ctx, timeout_ms);
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while ((read8(addr) & mask) == 0) {
-        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        if (steps.step(null, false) != .proceed or controller_reset.expired(start, ctx.tickCount(), span)) return false;
         ctx.waitTicks(1);
     }
     return true;
 }
 
-fn wait16ClearTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u16, timeout_ms: u64) bool {
+fn wait16ClearTimed(ctx: *const r4os.r4dev.DriverContext2, addr: u64, mask: u16, timeout_ms: u64) bool {
     return wait16ValueTimed(ctx, addr, mask, 0, timeout_ms);
 }
 
-fn wait16ValueTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u16, value: u16, timeout_ms: u64) bool {
+fn wait16ValueTimed(ctx: *const r4os.r4dev.DriverContext2, addr: u64, mask: u16, value: u16, timeout_ms: u64) bool {
     const start = ctx.tickCount();
     const span = msTicks(ctx, timeout_ms);
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while ((read16(addr) & mask) != value) {
-        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        if (steps.step(null, false) != .proceed or controller_reset.expired(start, ctx.tickCount(), span)) return false;
         ctx.waitTicks(1);
     }
     return true;
 }
 
-fn wait32SetTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u32, timeout_ms: u64) bool {
+fn wait32SetTimed(ctx: *const r4os.r4dev.DriverContext2, addr: u64, mask: u32, timeout_ms: u64) bool {
     const start = ctx.tickCount();
     const span = msTicks(ctx, timeout_ms);
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while ((read32(addr) & mask) == 0) {
-        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        if (steps.step(null, false) != .proceed or controller_reset.expired(start, ctx.tickCount(), span)) return false;
         ctx.waitTicks(1);
     }
     return true;
 }
 
-fn wait32ClearTimed(ctx: *const r4os.r4dev.DriverContext, addr: u64, mask: u32, timeout_ms: u64) bool {
+fn wait32ClearTimed(ctx: *const r4os.r4dev.DriverContext2, addr: u64, mask: u32, timeout_ms: u64) bool {
     const start = ctx.tickCount();
     const span = msTicks(ctx, timeout_ms);
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(span +| 8, .task);
     while ((read32(addr) & mask) != 0) {
-        if (controller_reset.expired(start, ctx.tickCount(), span)) return false;
+        if (steps.step(null, false) != .proceed or controller_reset.expired(start, ctx.tickCount(), span)) return false;
         ctx.waitTicks(1);
     }
     return true;
 }
 
 fn wait32Set(addr: u64, mask: u32, limit: u32) bool {
-    var guard: u32 = 0;
-    while ((read32(addr) & mask) == 0 and guard < limit) : (guard += 1) {}
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(limit, .no_sleep);
+    while ((read32(addr) & mask) == 0) {
+        if (steps.step(null, false) != .proceed) break;
+    }
     return (read32(addr) & mask) != 0;
 }
 
 fn wait32Clear(addr: u64, mask: u32, limit: u32) bool {
-    var guard: u32 = 0;
-    while ((read32(addr) & mask) != 0 and guard < limit) : (guard += 1) {}
+    var steps = r4os.driver_poll_budget.DriverPollBudget.initIterations(limit, .no_sleep);
+    while ((read32(addr) & mask) != 0) {
+        if (steps.step(null, false) != .proceed) break;
+    }
     return (read32(addr) & mask) == 0;
 }
 
-fn logDevice(ctx: *const r4os.r4dev.DriverContext, info: r4os.abi.PciDeviceInfo) void {
+fn logDevice(ctx: *const r4os.r4dev.DriverContext2, info: r4os.abi.PciDeviceInfo) void {
     var line: [128:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D device ");
@@ -4204,7 +4219,7 @@ fn logDevice(ctx: *const r4os.r4dev.DriverContext, info: r4os.abi.PciDeviceInfo)
     logLine(ctx, &line, len);
 }
 
-fn logMmio(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logMmio(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [160:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D mmio phys=0x");
@@ -4228,7 +4243,7 @@ fn logMmio(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logLine(ctx, &line, len);
 }
 
-fn logTransport(state: *State, ctx: *const r4os.r4dev.DriverContext, codec: u8, vendor_id: u32) void {
+fn logTransport(state: *State, ctx: *const r4os.r4dev.DriverContext2, codec: u8, vendor_id: u32) void {
     var line: [128:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D transport ");
@@ -4244,7 +4259,7 @@ fn logControllerCandidate(
     ctx: anytype,
     candidate: ControllerCandidateSnapshot,
 ) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 256 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 256 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D controller candidate index=");
     appendDec(&line, &len, candidate.evidence.inventory_index);
@@ -4324,7 +4339,7 @@ fn logControllerSelectionEvidence(state: anytype, ctx: anytype) void {
 }
 
 fn logSelectedController(state: anytype, ctx: anytype) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 128 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 128 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D selected controller index=");
     appendDec(&line, &len, state.selected_inventory_index);
@@ -4335,7 +4350,7 @@ fn logSelectedController(state: anytype, ctx: anytype) void {
     logLine(ctx, &line, len);
 }
 
-fn logCodecInfo(ctx: *const r4os.r4dev.DriverContext, info: *const CodecInfo) void {
+fn logCodecInfo(ctx: *const r4os.r4dev.DriverContext2, info: *const CodecInfo) void {
     var line: [144:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D codec ");
@@ -4355,7 +4370,7 @@ fn logCodecInfo(ctx: *const r4os.r4dev.DriverContext, info: *const CodecInfo) vo
     logLine(ctx, &line, len);
 }
 
-fn logOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [192:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D output candidate codec=");
@@ -4377,7 +4392,7 @@ fn logOutputCandidate(state: *State, ctx: *const r4os.r4dev.DriverContext) void 
     logLine(ctx, &line, len);
 }
 
-fn logOutputPath(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logOutputPath(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [224:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D output path codec=");
@@ -4401,7 +4416,7 @@ fn logOutputPath(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logOutputVerbPlan(state, ctx);
 }
 
-fn logOutputRoute(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logOutputRoute(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [320:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D route ");
@@ -4418,7 +4433,7 @@ fn logOutputRoute(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logLine(ctx, &line, len);
 }
 
-fn logOutputVerbPlan(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logOutputVerbPlan(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     const operations = state.route_program_plan.slice();
     var start: usize = 0;
     while (start < operations.len) {
@@ -4443,7 +4458,7 @@ fn logOutputVerbPlan(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     }
 }
 
-fn logJackPolicy(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logJackPolicy(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [176:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D jack sense=");
@@ -4498,7 +4513,7 @@ fn operationName(kind: codec_program.OperationKind) []const u8 {
     };
 }
 
-fn logStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [224:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D stream dma desc=");
@@ -4520,7 +4535,7 @@ fn logStreamDma(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
     logLine(ctx, &line, len);
 }
 
-fn logInterruptSetup(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logInterruptSetup(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [128:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D interrupts mode=");
@@ -4535,7 +4550,7 @@ fn logInterruptSetup(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
 }
 
 fn logIdleSummary(state: anytype, ctx: anytype) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 256 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 256 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.IDLE pci=");
     appendHex(&line, &len, state.info.bus, 2);
@@ -4560,7 +4575,7 @@ fn logIdleSummary(state: anytype, ctx: anytype) void {
     logLine(ctx, &line, len);
 }
 
-fn logPlaybackSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logPlaybackSummary(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (!@atomicLoad(bool, &state.initialized, .acquire) and state.start_count == 0 and state.write_count == 0) return;
     var line: [224:0]u8 = undefined;
     var len: usize = 0;
@@ -4619,7 +4634,7 @@ fn logPlaybackSummary(state: *State, ctx: *const r4os.r4dev.DriverContext) void 
     logLine(ctx, &detail, len);
 }
 
-fn logPlaybackReady(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logPlaybackReady(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     var line: [160:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.R4D playback backend ready codecs=");
@@ -4639,7 +4654,7 @@ fn logPlaybackReady(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
 /// below the LogService record size and is emitted only for ready, close and
 /// shutdown transitions, never for individual writes, verbs or interrupts.
 fn logDiagnosticCore(state: anytype, ctx: anytype) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 160 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 160 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.DIAG core stage=");
     appendText(&line, &len, stageName(state.stage));
@@ -4685,7 +4700,7 @@ fn logDiagnosticCore(state: anytype, ctx: anytype) void {
 }
 
 fn logDiagnosticRuntime(state: anytype, ctx: anytype, phase: []const u8) void {
-    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext) 160 else close_diagnostics.max_body_bytes:0]u8 = undefined;
+    var line: [if (@TypeOf(ctx.*) == r4os.r4dev.DriverContext2) 160 else close_diagnostics.max_body_bytes:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.DIAG run phase=");
     appendText(&line, &len, phase);
@@ -4724,7 +4739,7 @@ fn logDiagnosticRuntime(state: anytype, ctx: anytype, phase: []const u8) void {
     logLine(ctx, &line, len);
 }
 
-fn logInitFailure(state: *State, ctx: *const r4os.r4dev.DriverContext, stage: InitStage) void {
+fn logInitFailure(state: *State, ctx: *const r4os.r4dev.DriverContext2, stage: InitStage) void {
     var line: [96:0]u8 = undefined;
     var len: usize = 0;
     appendText(&line, &len, "HDA.DIAG init-failed stage=");
@@ -4734,7 +4749,7 @@ fn logInitFailure(state: *State, ctx: *const r4os.r4dev.DriverContext, stage: In
     logLine(ctx, &line, len);
 }
 
-fn logWriteRejectOnce(state: *State, ctx: *const r4os.r4dev.DriverContext) void {
+fn logWriteRejectOnce(state: *State, ctx: *const r4os.r4dev.DriverContext2) void {
     if (state.write_reject_logged) return;
     state.write_reject_logged = true;
     var line: [128:0]u8 = undefined;
@@ -4923,10 +4938,11 @@ test "retired PCM detail timing does not read the clock for invalid writes" {
         }
     };
     Probe.reads = 0;
-    var api: r4os.abi.DriverApi = undefined;
-    api.magic = r4os.abi.driver_magic;
-    api.version = r4os.abi.driver_api_version;
-    api.size = @sizeOf(r4os.abi.DriverApi);
+    var api: r4os.abi.DriverApi2 = undefined;
+    @memset(std.mem.asBytes(&api), 0);
+    api.magic = r4os.technical2.abi.driver_magic;
+    api.version = r4os.technical2.abi.driver_version;
+    api.size = @sizeOf(r4os.abi.DriverApi2);
     api.tick_count = Probe.tick;
     const bytes = [_]u8{ 1, 2, 3, 4 };
     var local: State = .{ .api = &api };
@@ -4954,10 +4970,11 @@ test "retired PCM detail timing preserves real refill work without clock reads" 
         }
     };
     Probe.reads = 0;
-    var api: r4os.abi.DriverApi = undefined;
-    api.magic = r4os.abi.driver_magic;
-    api.version = r4os.abi.driver_api_version;
-    api.size = @sizeOf(r4os.abi.DriverApi);
+    var api: r4os.abi.DriverApi2 = undefined;
+    @memset(std.mem.asBytes(&api), 0);
+    api.magic = r4os.technical2.abi.driver_magic;
+    api.version = r4os.technical2.abi.driver_version;
+    api.size = @sizeOf(r4os.abi.DriverApi2);
     api.tick_count = Probe.tick;
     var dma: [DMA_RING_BYTES]u8 = @splat(0xAA);
     var input: [DMA_BUFFER_BYTES]u8 = undefined;
@@ -4985,4 +5002,41 @@ test "retired PCM detail timing preserves real refill work without clock reads" 
     try t.expectEqual(@as(u64, 480), local.pcm_cursor.current.submitted);
     try t.expectEqual(@as(u64, 0), local.pcm_cursor.current.consumed);
     try t.expectEqual(@as(usize, 0), Probe.reads);
+}
+
+test "HDA poll budget terminates real timed register helpers with a frozen clock" {
+    const t = std.testing;
+    const P = struct {
+        var waits: usize = 0;
+        fn tick() callconv(.c) u64 {
+            return 100;
+        }
+        fn frequency() callconv(.c) u32 {
+            return 100;
+        }
+        fn wait(_: u64) callconv(.c) void {
+            waits += 1;
+        }
+    };
+    var api: r4os.abi.DriverApi2 = undefined;
+    @memset(std.mem.asBytes(&api), 0);
+    api.magic = r4os.technical2.abi.driver_magic;
+    api.version = r4os.technical2.abi.driver_version;
+    api.size = @sizeOf(r4os.abi.DriverApi2);
+    api.tick_count = P.tick;
+    api.timer_frequency = P.frequency;
+    api.wait_ticks = P.wait;
+    const ctx = r4os.r4dev.DriverContext2.init(&api);
+    var value: u32 align(4) = 0;
+    P.waits = 0;
+    try t.expect(!wait8SetTimed(&ctx, @intFromPtr(&value), 1, 10));
+    try t.expect(!wait16ValueTimed(&ctx, @intFromPtr(&value), 1, 1, 10));
+    try t.expect(!wait32SetTimed(&ctx, @intFromPtr(&value), 1, 10));
+    try t.expect(!wait32Set(@intFromPtr(&value), 1, 3));
+    value = 1;
+    try t.expect(!wait8ClearTimed(&ctx, @intFromPtr(&value), 1, 10));
+    try t.expect(!wait32ClearTimed(&ctx, @intFromPtr(&value), 1, 10));
+    try t.expect(!wait32Clear(@intFromPtr(&value), 1, 3));
+    try t.expect(P.waits > 0 and P.waits <= 64);
+    try t.expectEqual(@as(u32, 1), value); // timeout never changes hardware state
 }
